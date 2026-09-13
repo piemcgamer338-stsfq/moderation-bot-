@@ -7,14 +7,12 @@ from datetime import timedelta
 
 import discord
 from discord.ext import commands
-from dotenv import load_dotenv
 
 
 # =========================================================
 # SETUP
 # =========================================================
 
-load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
 PREFIX = "."
