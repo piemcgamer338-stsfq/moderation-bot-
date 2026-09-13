@@ -3,7 +3,7 @@ import re
 import random
 import asyncio
 from collections import defaultdict, deque
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 import discord
 from discord.ext import commands
@@ -11,7 +11,7 @@ from discord.ui import LayoutView, Container, TextDisplay, Separator, ActionRow,
 
 
 # =========================================================
-# SETUP
+# THUNDERNIGHT
 # =========================================================
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -46,7 +46,7 @@ guild_settings = defaultdict(lambda: {
     },
     "welcome": {
         "channels": [],
-        "message": "Welcome {user} to {server}!",
+        "message": "Welcome {user} to {server}!"
     },
     "level": {
         "channel": None,
@@ -94,43 +94,6 @@ def is_admin():
     return commands.check(predicate)
 
 
-def get_member_text(member):
-    return f"{member.mention}"
-
-
-def replace_variables(message, member=None, guild=None, level=None):
-    if guild is None and member:
-        guild = member.guild
-
-    if guild is None:
-        return message
-
-    if member:
-        values = {
-            "{user}": member.mention,
-            "{username}": member.name,
-            "{userid}": str(member.id),
-            "{user_id}": str(member.id),
-            "{server}": guild.name,
-            "{serverid}": str(guild.id),
-            "{server_id}": str(guild.id),
-        }
-    else:
-        values = {
-            "{server}": guild.name,
-            "{serverid}": str(guild.id),
-            "{server_id}": str(guild.id),
-        }
-
-    if level is not None:
-        values["{level}"] = str(level)
-
-    for key, value in values.items():
-        message = message.replace(key, value)
-
-    return message
-
-
 def format_duration(seconds):
     seconds = max(0, int(seconds))
 
@@ -156,7 +119,7 @@ def format_duration(seconds):
 
 
 def format_end_time(dt):
-    return dt.strftime("%-I:%M %p, %-d %B %Y")
+    return dt.strftime("%I:%M %p, %d %B %Y").lstrip("0").replace(" 0", " ")
 
 
 def parse_duration(value):
@@ -169,7 +132,7 @@ def parse_duration(value):
 
     if not match:
         raise ValueError(
-            "Invalid duration. Use formats such as `30m`, `1h`, `1d`."
+            "Invalid duration. Use `30s`, `10m`, `1h`, `1d` or `1w`."
         )
 
     amount = float(match.group(1))
@@ -186,22 +149,56 @@ def parse_duration(value):
     return int(amount * multipliers[unit])
 
 
-async def send_card(
-    destination,
-    title,
-    description,
-    *,
-    components=None,
-    ephemeral=False
-):
+def replace_variables(message, member=None, guild=None, level=None):
+    if guild is None and member:
+        guild = member.guild
+
+    if guild is None:
+        return message
+
+    values = {
+        "{server}": guild.name,
+        "{serverid}": str(guild.id),
+        "{server_id}": str(guild.id),
+        "{membercount}": str(guild.member_count),
+    }
+
+    if member:
+        values.update({
+            "{user}": member.mention,
+            "{username}": member.name,
+            "{userid}": str(member.id),
+            "{user_id}": str(member.id),
+            "{channel}": "",
+            "{channel_id}": "",
+            "{created}": f"<t:{int(member.created_at.timestamp())}:F>",
+            "{joined}": (
+                f"<t:{int(member.joined_at.timestamp())}:F>"
+                if member.joined_at
+                else ""
+            )
+        })
+
+    if level is not None:
+        values["{level}"] = str(level)
+
+    for key, value in values.items():
+        message = message.replace(key, value)
+
+    return message
+
+
+# =========================================================
+# COMPONENTS V2 CARD
+# =========================================================
+
+def make_card(title, description, components=None):
     view = LayoutView(timeout=None)
 
     container = Container()
 
     container.add_item(
-        TextDisplay(
-            f"## {title}"
-        )
+        TextDisplay(f"## {title}")
     )
 
     if description:
@@ -215,6 +212,22 @@ async def send_card(
             container.add_item(component)
 
     view.add_item(container)
+
+    return view
+
+
+async def send_card(
+    destination,
+    title,
+    description,
+    components=None,
+    ephemeral=False
+):
+    view = make_card(
+        title,
+        description,
+        components
+    )
 
     if isinstance(destination, discord.Interaction):
         if destination.response.is_done():
@@ -235,184 +248,27 @@ async def edit_card(
     interaction,
     title,
     description,
-    *,
     components=None
 ):
-    view = LayoutView(timeout=None)
-
-    container = Container()
-
-    container.add_item(
-        TextDisplay(f"## {title}")
+    view = make_card(
+        title,
+        description,
+        components
     )
 
-    if description:
-        container.add_item(Separator())
-        container.add_item(TextDisplay(description))
-
-    if components:
-        for component in components:
-            container.add_item(component)
-
-    view.add_item(container)
-
-    await interaction.response.edit_message(view=view)
-
-
-# =========================================================
-# COMPONENTS V2 HELP
-# =========================================================
-
-HELP_CATEGORIES = {
-    "Moderation": [
-        ".ban @user",
-        ".kick @user",
-        ".mute @user [duration]",
-        ".lock",
-        ".unlock",
-        ".hide",
-        ".unhide",
-        ".unban [userid]",
-        ".nuke",
-        ".clone",
-        ".purge [amount]",
-        ".snipe"
-    ],
-    "Greet": [
-        ".greet delafter [seconds]",
-        ".greet message [message]",
-        ".greet variables",
-        ".greet setchannel #channel",
-        ".greet removechannel #channel",
-        ".greet reset"
-    ],
-    "Welcome": [
-        ".welcome channel #channel",
-        ".welcome message [message]",
-        ".welcome variables",
-        ".welcome reset"
-    ],
-    "Level": [
-        ".lvl [user]",
-        ".level channel #channel",
-        ".level lb",
-        ".level lbreset",
-        ".lvl message [message]",
-        ".lvl variables"
-    ],
-    "Invites": [
-        ".i [user]",
-        ".lb i",
-        ".lbreset"
-    ],
-    "General": [
-        ".avatar [user]",
-        ".banner [user]",
-        ".srvlogo",
-        ".srvbanner",
-        ".profile",
-        ".si",
-        ".tstart [time] [name]",
-        ".tend [name]",
-        ".tpause [name]"
-    ],
-    "Giveaway": [
-        ".gstart [time] [winners] [reward]",
-        ".gend [message id]",
-        ".gblacklist @user"
-    ]
-}
-
-
-def help_text(category=None):
-    if category is None:
-        total = sum(len(x) for x in HELP_CATEGORIES.values())
-
-        return (
-            "Hey, I'm Dream Land Security\n\n"
-            "My prefix for this server is `.`\n"
-            "Type `.help [context]` for more\n\n"
-            f"Total commands: {total}\n\n"
-            "Modules\n"
-            "Moderation\n"
-            "Greet\n"
-            "Welcome\n"
-            "Level\n"
-            "Invites\n"
-            "General\n"
-            "Giveaway\n\n"
-            "Select a module to see its commands."
-        )
-
-    commands_list = HELP_CATEGORIES.get(category, [])
-
-    return (
-        f"Module: **{category}**\n\n"
-        + "\n".join(f"`{command}`" for command in commands_list)
+    await interaction.response.edit_message(
+        view=view
     )
 
 
-class HelpSelect(Select):
-    def __init__(self):
-        options = [
-            discord.SelectOption(
-                label=name,
-                value=name
-            )
-            for name in HELP_CATEGORIES
-        ]
-
-        super().__init__(
-            placeholder="Select a module",
-            options=options,
-            custom_id="dreamland_help_select"
-        )
-
-    async def callback(self, interaction):
-        await edit_card(
-            interaction,
-            "Dream Land Security",
-            help_text(self.values[0]),
-            components=[
-                ActionRow(HelpSelect()),
-                ActionRow(HelpBack())
-            ]
-        )
-
-
-class HelpBack(Button):
-    def __init__(self):
-        super().__init__(
-            label="Back",
-            style=discord.ButtonStyle.secondary,
-            custom_id="dreamland_help_back"
-        )
-
-    async def callback(self, interaction):
-        await edit_card(
-            interaction,
-            "Dream Land Security",
-            help_text(),
-            components=[
-                ActionRow(HelpSelect())
-            ]
-        )
-
-
-def make_help_view():
-    return [
-        ActionRow(HelpSelect())
-    ]
-
-
 # =========================================================
-# BASIC EVENTS
+# EVENTS
 # =========================================================
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id})")
-    print("Dream Land Security is ready.")
+    print("Thundernight is ready.")
 
 
 @bot.event
@@ -431,36 +287,179 @@ async def on_message_delete(message):
 # HELP
 # =========================================================
 
+HELP_CATEGORIES = {
+    "Moderation": [
+        ".ban @user",
+        ".kick @user",
+        ".mute @user [duration]",
+        ".lock",
+        ".unlock",
+        ".hide",
+        ".unhide",
+        ".unban [userid]",
+        ".nuke",
+        ".clone",
+        ".purge [amount]",
+        ".snipe"
+    ],
+
+    "Greet": [
+        ".greet delafter [seconds]",
+        ".greet message [message]",
+        ".greet variables",
+        ".greet setchannel #channel",
+        ".greet removechannel #channel",
+        ".greet reset"
+    ],
+
+    "Welcome": [
+        ".welcome channel #channel",
+        ".welcome message [message]",
+        ".welcome variables",
+        ".welcome reset"
+    ],
+
+    "Level": [
+        ".lvl [user]",
+        ".level channel #channel",
+        ".level lb",
+        ".level lbreset",
+        ".lvlmessage [message]",
+        ".lvlvariables"
+    ],
+
+    "Invites": [
+        ".i [user]",
+        ".lb i",
+        ".lbreset"
+    ],
+
+    "General": [
+        ".avatar [user]",
+        ".banner [user]",
+        ".srvlogo",
+        ".srvbanner",
+        ".profile",
+        ".si",
+        ".tstart [time] [name]",
+        ".tend [name]",
+        ".tpause [name]"
+    ],
+
+    "Giveaway": [
+        ".gstart [time] [winners] [reward]",
+        ".gend [message id]",
+        ".gblacklist @user"
+    ]
+}
+
+
+def help_description(category=None):
+    if category is None:
+        total = sum(
+            len(commands_list)
+            for commands_list in HELP_CATEGORIES.values()
+        )
+
+        return (
+            "Hey, I'm Thundernight.\n\n"
+            "My prefix for this server is `.`\n"
+            "Type `.help [context]` for more.\n\n"
+            f"Total commands: `{total}`\n\n"
+            "Modules\n"
+            "Moderation\n"
+            "Greet\n"
+            "Welcome\n"
+            "Level\n"
+            "Invites\n"
+            "General\n"
+            "Giveaway\n\n"
+            "Select a module to see its commands."
+        )
+
+    return (
+        f"Module: **{category}**\n\n"
+        + "\n".join(
+            f"`{command}`"
+            for command in HELP_CATEGORIES[category]
+        )
+    )
+
+
+class HelpSelect(Select):
+    def __init__(self):
+        super().__init__(
+            placeholder="Select a module",
+            options=[
+                discord.SelectOption(
+                    label=category,
+                    value=category
+                )
+                for category in HELP_CATEGORIES
+            ],
+            custom_id="thundernight_help_select"
+        )
+
+    async def callback(self, interaction):
+        await edit_card(
+            interaction,
+            "Thundernight",
+            help_description(self.values[0]),
+            [
+                ActionRow(HelpSelect()),
+                ActionRow(HelpBack())
+            ]
+        )
+
+
+class HelpBack(Button):
+    def __init__(self):
+        super().__init__(
+            label="Back",
+            style=discord.ButtonStyle.secondary,
+            custom_id="thundernight_help_back"
+        )
+
+    async def callback(self, interaction):
+        await edit_card(
+            interaction,
+            "Thundernight",
+            help_description(),
+            [
+                ActionRow(HelpSelect())
+            ]
+        )
+
+
 @bot.command(name="help")
 async def help_command(ctx, category=None):
+    selected = None
+
     if category:
-        category = category.lower()
-
-        found = None
-
         for name in HELP_CATEGORIES:
-            if name.lower() == category:
-                found = name
+            if name.lower() == category.lower():
+                selected = name
                 break
 
-        if found:
-            await send_card(
-                ctx,
-                "Dream Land Security",
-                help_text(found),
-                components=[
-                    ActionRow(HelpSelect()),
-                    ActionRow(HelpBack())
-                ]
-            )
-            return
-
-    await send_card(
-        ctx,
-        "Dream Land Security",
-        help_text(),
-        components=make_help_view()
-    )
+    if selected:
+        await send_card(
+            ctx,
+            "Thundernight",
+            help_description(selected),
+            [
+                ActionRow(HelpSelect()),
+                ActionRow(HelpBack())
+            ]
+        )
+    else:
+        await send_card(
+            ctx,
+            "Thundernight",
+            help_description(),
+            [
+                ActionRow(HelpSelect())
+            ]
+        )
 
 
 # =========================================================
@@ -504,11 +503,11 @@ async def mute(ctx, member: discord.Member, duration=None):
 
     try:
         seconds = parse_duration(duration)
-    except ValueError as e:
+    except ValueError as error:
         await send_card(
             ctx,
             "Mute",
-            str(e)
+            str(error)
         )
         return
 
@@ -520,24 +519,28 @@ async def mute(ctx, member: discord.Member, duration=None):
         )
         return
 
-    until = discord.utils.utcnow() + timedelta(seconds=seconds)
-
     await member.timeout(
-        until,
+        timedelta(seconds=seconds),
         reason=f"Muted by {ctx.author}"
     )
 
     await send_card(
         ctx,
         "User Muted",
-        f"{member.mention} has been muted for `{format_duration(seconds)}`."
+        (
+            f"{member.mention} has been muted for "
+            f"`{format_duration(seconds)}`."
+        )
     )
 
 
 @bot.command()
 @is_admin()
 async def lock(ctx):
-    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+    overwrite = ctx.channel.overwrites_for(
+        ctx.guild.default_role
+    )
+
     overwrite.send_messages = False
 
     await ctx.channel.set_permissions(
@@ -555,7 +558,10 @@ async def lock(ctx):
 @bot.command()
 @is_admin()
 async def unlock(ctx):
-    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+    overwrite = ctx.channel.overwrites_for(
+        ctx.guild.default_role
+    )
+
     overwrite.send_messages = None
 
     await ctx.channel.set_permissions(
@@ -573,7 +579,10 @@ async def unlock(ctx):
 @bot.command()
 @is_admin()
 async def hide(ctx):
-    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+    overwrite = ctx.channel.overwrites_for(
+        ctx.guild.default_role
+    )
+
     overwrite.view_channel = False
 
     await ctx.channel.set_permissions(
@@ -591,7 +600,10 @@ async def hide(ctx):
 @bot.command()
 @is_admin()
 async def unhide(ctx):
-    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+    overwrite = ctx.channel.overwrites_for(
+        ctx.guild.default_role
+    )
+
     overwrite.view_channel = None
 
     await ctx.channel.set_permissions(
@@ -623,8 +635,30 @@ async def unban(ctx, user_id: int):
         await send_card(
             ctx,
             "Unban Failed",
-            "That user could not be found in the ban list."
+            "That user is not currently banned."
         )
+
+
+@bot.command()
+@is_admin()
+async def purge(ctx, amount: int):
+    if amount <= 0:
+        await send_card(
+            ctx,
+            "Purge",
+            "Amount must be greater than zero."
+        )
+        return
+
+    deleted = await ctx.channel.purge(
+        limit=amount
+    )
+
+    await send_card(
+        ctx,
+        "Messages Purged",
+        f"Deleted `{len(deleted)}` messages."
+    )
 
 
 @bot.command()
@@ -633,7 +667,6 @@ async def nuke(ctx):
     old_channel = ctx.channel
 
     new_channel = await old_channel.clone(
-        name=old_channel.name,
         reason=f"Nuked by {ctx.author}"
     )
 
@@ -648,7 +681,7 @@ async def nuke(ctx):
     await send_card(
         new_channel,
         "Channel Nuked",
-        f"This channel was recreated by {ctx.author.mention}."
+        f"Channel recreated by {ctx.author.mention}."
     )
 
 
@@ -658,7 +691,6 @@ async def clone(ctx):
     old_channel = ctx.channel
 
     new_channel = await old_channel.clone(
-        name=old_channel.name,
         reason=f"Cloned by {ctx.author}"
     )
 
@@ -673,27 +705,7 @@ async def clone(ctx):
     await send_card(
         new_channel,
         "Channel Cloned",
-        f"This channel was recreated by {ctx.author.mention}."
-    )
-
-
-@bot.command()
-@is_admin()
-async def purge(ctx, amount: int):
-    if amount <= 0:
-        await send_card(
-            ctx,
-            "Purge",
-            "Amount must be greater than zero."
-        )
-        return
-
-    deleted = await ctx.channel.purge(limit=amount)
-
-    await send_card(
-        ctx,
-        "Messages Purged",
-        f"Deleted `{len(deleted)}` messages."
+        f"Channel recreated by {ctx.author.mention}."
     )
 
 
@@ -731,7 +743,6 @@ async def greet(ctx):
         ctx,
         "Greet",
         (
-            "Use one of these commands:\n\n"
             "`.greet delafter [seconds]`\n"
             "`.greet message [message]`\n"
             "`.greet variables`\n"
@@ -745,11 +756,14 @@ async def greet(ctx):
 @greet.command(name="delafter")
 @is_admin()
 async def greet_delafter(ctx, seconds: int):
-    guild_settings[ctx.guild.id]["greet"]["delete_after"] = max(0, seconds)
+    guild_settings[ctx.guild.id]["greet"]["delete_after"] = max(
+        0,
+        seconds
+    )
 
     await send_card(
         ctx,
-        "Greet Settings",
+        "Greet",
         f"Greet messages will be deleted after `{seconds}` seconds."
     )
 
@@ -761,8 +775,8 @@ async def greet_message(ctx, *, message):
 
     await send_card(
         ctx,
-        "Greet Message",
-        "The greet message has been updated."
+        "Greet",
+        "Greet message updated."
     )
 
 
@@ -779,8 +793,6 @@ async def greet_variables(ctx):
             "`{server}`\n"
             "`{serverid}`\n"
             "`{server_id}`\n"
-            "`{channel}`\n"
-            "`{channel_id}`\n"
             "`{membercount}`\n"
             "`{created}`\n"
             "`{joined}`"
@@ -798,7 +810,7 @@ async def greet_setchannel(ctx, channel: discord.TextChannel):
             await send_card(
                 ctx,
                 "Greet",
-                "You can configure a maximum of 5 greet channels."
+                "Maximum of 5 greet channels allowed."
             )
             return
 
@@ -806,8 +818,8 @@ async def greet_setchannel(ctx, channel: discord.TextChannel):
 
     await send_card(
         ctx,
-        "Greet Channel",
-        f"{channel.mention} has been added to greet channels."
+        "Greet",
+        f"{channel.mention} has been added."
     )
 
 
@@ -821,7 +833,7 @@ async def greet_removechannel(ctx, channel: discord.TextChannel):
 
     await send_card(
         ctx,
-        "Greet Channel",
+        "Greet",
         f"{channel.mention} has been removed."
     )
 
@@ -837,7 +849,7 @@ async def greet_reset(ctx):
 
     await send_card(
         ctx,
-        "Greet Reset",
+        "Greet",
         "Greet settings have been reset."
     )
 
@@ -852,7 +864,6 @@ async def welcome(ctx):
         ctx,
         "Welcome",
         (
-            "Use one of these commands:\n\n"
             "`.welcome channel #channel`\n"
             "`.welcome message [message]`\n"
             "`.welcome variables`\n"
@@ -871,7 +882,7 @@ async def welcome_channel(ctx, channel: discord.TextChannel):
             await send_card(
                 ctx,
                 "Welcome",
-                "You can configure a maximum of 5 welcome channels."
+                "Maximum of 5 welcome channels allowed."
             )
             return
 
@@ -879,7 +890,7 @@ async def welcome_channel(ctx, channel: discord.TextChannel):
 
     await send_card(
         ctx,
-        "Welcome Channel",
+        "Welcome",
         f"{channel.mention} has been added."
     )
 
@@ -891,8 +902,8 @@ async def welcome_message(ctx, *, message):
 
     await send_card(
         ctx,
-        "Welcome Message",
-        "The welcome message has been updated."
+        "Welcome",
+        "Welcome message updated."
     )
 
 
@@ -909,8 +920,6 @@ async def welcome_variables(ctx):
             "`{server}`\n"
             "`{serverid}`\n"
             "`{server_id}`\n"
-            "`{channel}`\n"
-            "`{channel_id}`\n"
             "`{membercount}`\n"
             "`{created}`\n"
             "`{joined}`"
@@ -928,44 +937,9 @@ async def welcome_reset(ctx):
 
     await send_card(
         ctx,
-        "Welcome Reset",
+        "Welcome",
         "Welcome settings have been reset."
     )
-
-
-@bot.event
-async def on_member_join(member):
-    guild = member.guild
-
-    data = invite_data[(guild.id, member.id)]
-
-    data["joins"] += 1
-
-    if (guild.id, member.id) in member_inviter:
-        data["rejoins"] += 1
-
-    if (
-        datetime.now(timezone.utc) - member.created_at
-    ).days < 15:
-        data["fake"] += 1
-
-    settings = guild_settings[guild.id]["welcome"]
-
-    message = replace_variables(
-        settings["message"],
-        member,
-        guild
-    )
-
-    for channel_id in settings["channels"]:
-        channel = guild.get_channel(channel_id)
-
-        if channel:
-            await send_card(
-                channel,
-                "Welcome",
-                message
-            )
 
 
 # =========================================================
@@ -976,7 +950,9 @@ async def on_member_join(member):
 async def lvl(ctx, member: discord.Member = None):
     member = member or ctx.author
 
-    data = level_data[(ctx.guild.id, member.id)]
+    data = level_data[
+        (ctx.guild.id, member.id)
+    ]
 
     await send_card(
         ctx,
@@ -995,7 +971,6 @@ async def level(ctx):
         ctx,
         "Level",
         (
-            "Use:\n\n"
             "`.level channel #channel`\n"
             "`.level lb`\n"
             "`.level lbreset`"
@@ -1010,7 +985,7 @@ async def level_channel(ctx, channel: discord.TextChannel):
 
     await send_card(
         ctx,
-        "Level Channel",
+        "Level",
         f"Level-up messages will be sent in {channel.mention}."
     )
 
@@ -1020,29 +995,39 @@ async def level_lb(ctx):
     users = []
 
     for (guild_id, user_id), data in level_data.items():
-        if guild_id != ctx.guild.id:
-            continue
-
-        users.append(
-            (user_id, data["level"], data["messages"])
-        )
+        if guild_id == ctx.guild.id:
+            users.append(
+                (
+                    user_id,
+                    data["level"],
+                    data["messages"]
+                )
+            )
 
     users.sort(
-        key=lambda x: (x[1], x[2]),
+        key=lambda item: (
+            item[1],
+            item[2]
+        ),
         reverse=True
     )
 
     lines = []
 
-    for index, (user_id, lvl_value, messages) in enumerate(
+    for index, (user_id, level_value, messages) in enumerate(
         users[:3],
         start=1
     ):
         member = ctx.guild.get_member(user_id)
-        name = member.mention if member else str(user_id)
+
+        name = (
+            member.mention
+            if member
+            else str(user_id)
+        )
 
         lines.append(
-            f"{index}. {name} — Level `{lvl_value}` — `{messages}` messages"
+            f"{index}. {name} — Level `{level_value}` — `{messages}` messages"
         )
 
     if not lines:
@@ -1065,24 +1050,24 @@ async def level_lbreset(ctx):
     await send_card(
         ctx,
         "Level Leaderboard",
-        "The level leaderboard has been reset."
+        "Level leaderboard has been reset."
     )
 
 
 @bot.command(name="lvlmessage")
 @is_admin()
-async def lvl_message(ctx, *, message):
+async def lvlmessage(ctx, *, message):
     guild_settings[ctx.guild.id]["level"]["message"] = message
 
     await send_card(
         ctx,
-        "Level Message",
-        "The level-up message has been updated."
+        "Level",
+        "Level-up message updated."
     )
 
 
 @bot.command(name="lvlvariables")
-async def lvl_variables(ctx):
+async def lvlvariables(ctx):
     await send_card(
         ctx,
         "Level Variables",
@@ -1097,13 +1082,20 @@ async def lvl_variables(ctx):
     )
 
 
+# =========================================================
+# LEVEL MESSAGE TRACKING
+# =========================================================
+
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
     if message.guild:
-        key = (message.guild.id, message.author.id)
+        key = (
+            message.guild.id,
+            message.author.id
+        )
 
         level_data[key]["messages"] += 1
 
@@ -1112,14 +1104,16 @@ async def on_message(message):
         if messages % 100 == 0:
             level_data[key]["level"] += 1
 
-            level = level_data[key]["level"]
+            level_value = level_data[key]["level"]
 
             channel_id = guild_settings[
                 message.guild.id
             ]["level"]["channel"]
 
             if channel_id:
-                channel = message.guild.get_channel(channel_id)
+                channel = message.guild.get_channel(
+                    channel_id
+                )
 
                 if channel:
                     text = replace_variables(
@@ -1128,7 +1122,7 @@ async def on_message(message):
                         ]["level"]["message"],
                         message.author,
                         message.guild,
-                        level
+                        level_value
                     )
 
                     await send_card(
@@ -1141,10 +1135,61 @@ async def on_message(message):
 
 
 # =========================================================
+# WELCOME EVENT
+# =========================================================
+
+@bot.event
+async def on_member_join(member):
+    guild = member.guild
+
+    key = (
+        guild.id,
+        member.id
+    )
+
+    data = invite_data[key]
+
+    data["joins"] += 1
+
+    if key in member_inviter:
+        data["rejoins"] += 1
+
+    account_age = (
+        discord.utils.utcnow()
+        - member.created_at
+    ).days
+
+    if account_age < 15:
+        data["fake"] += 1
+
+    settings = guild_settings[
+        guild.id
+    ]["welcome"]
+
+    message = replace_variables(
+        settings["message"],
+        member,
+        guild
+    )
+
+    for channel_id in settings["channels"]:
+        channel = guild.get_channel(
+            channel_id
+        )
+
+        if channel:
+            await send_card(
+                channel,
+                "Welcome",
+                message
+            )
+
+
+# =========================================================
 # INVITES
 # =========================================================
 
-async def cache_guild_invites(guild):
+async def cache_invites(guild):
     try:
         invites = await guild.invites()
 
@@ -1159,18 +1204,7 @@ async def cache_guild_invites(guild):
 
 @bot.event
 async def on_guild_join(guild):
-    await cache_guild_invites(guild)
-
-
-@bot.event
-async def on_member_remove(member):
-    key = (member.guild.id, member.id)
-
-    if key in member_inviter:
-        inviter_id = member_inviter[key]
-        invite_data[
-            (member.guild.id, inviter_id)
-        ]["left"] += 1
+    await cache_invites(guild)
 
 
 @bot.command(name="i")
@@ -1195,8 +1229,23 @@ async def invite_info(ctx, member: discord.Member = None):
     )
 
 
+@bot.event
+async def on_member_remove(member):
+    key = (
+        member.guild.id,
+        member.id
+    )
+
+    if key in member_inviter:
+        inviter_id = member_inviter[key]
+
+        invite_data[
+            (member.guild.id, inviter_id)
+        ]["left"] += 1
+
+
 @bot.command(name="lb")
-async def leaderboard(ctx, category=None):
+async def invite_leaderboard(ctx, category=None):
     if category != "i":
         await send_card(
             ctx,
@@ -1208,15 +1257,16 @@ async def leaderboard(ctx, category=None):
     users = []
 
     for (guild_id, user_id), data in invite_data.items():
-        if guild_id != ctx.guild.id:
-            continue
-
-        users.append(
-            (user_id, data["invites"])
-        )
+        if guild_id == ctx.guild.id:
+            users.append(
+                (
+                    user_id,
+                    data["invites"]
+                )
+            )
 
     users.sort(
-        key=lambda x: x[1],
+        key=lambda item: item[1],
         reverse=True
     )
 
@@ -1228,10 +1278,11 @@ async def leaderboard(ctx, category=None):
     ):
         member = ctx.guild.get_member(user_id)
 
-        if member:
-            name = member.mention
-        else:
-            name = str(user_id)
+        name = (
+            member.mention
+            if member
+            else str(user_id)
+        )
 
         lines.append(
             f"{index}. {name} — `{invites}` invites"
@@ -1249,7 +1300,7 @@ async def leaderboard(ctx, category=None):
 
 @bot.command(name="lbreset")
 @is_admin()
-async def lbreset(ctx):
+async def invite_lbreset(ctx):
     for key in list(invite_data.keys()):
         if key[0] == ctx.guild.id:
             del invite_data[key]
@@ -1257,7 +1308,7 @@ async def lbreset(ctx):
     await send_card(
         ctx,
         "Invite Leaderboard",
-        "The invite leaderboard has been reset."
+        "Invite leaderboard has been reset."
     )
 
 
@@ -1272,7 +1323,10 @@ async def avatar(ctx, member: discord.Member = None):
     await send_card(
         ctx,
         "Avatar",
-        f"{member.mention}\n{member.display_avatar.url}"
+        (
+            f"User: {member.mention}\n"
+            f"{member.display_avatar.url}"
+        )
     )
 
 
@@ -1280,7 +1334,9 @@ async def avatar(ctx, member: discord.Member = None):
 async def banner(ctx, member: discord.Member = None):
     member = member or ctx.author
 
-    user = await bot.fetch_user(member.id)
+    user = await bot.fetch_user(
+        member.id
+    )
 
     if not user.banner:
         await send_card(
@@ -1293,7 +1349,10 @@ async def banner(ctx, member: discord.Member = None):
     await send_card(
         ctx,
         "Banner",
-        f"{member.mention}\n{user.banner.url}"
+        (
+            f"User: {member.mention}\n"
+            f"{user.banner.url}"
+        )
     )
 
 
@@ -1342,7 +1401,8 @@ async def profile(ctx):
             f"Username: {member}\n"
             f"ID: `{member.id}`\n"
             f"Created: <t:{int(member.created_at.timestamp())}:F>\n"
-            f"Joined: <t:{int(member.joined_at.timestamp())}:F>"
+            f"Joined: "
+            f"{f'<t:{int(member.joined_at.timestamp())}:F>' if member.joined_at else 'Unknown'}"
         )
     )
 
@@ -1366,24 +1426,31 @@ async def server_info(ctx):
 
 
 # =========================================================
-# TIMER COMPONENT
+# TIMER
 # =========================================================
 
 class TimerView(LayoutView):
     def __init__(self, timer_id):
         super().__init__(timeout=None)
-        self.timer_id = timer_id
 
+        self.timer_id = timer_id
         self.container = Container()
         self.text = TextDisplay("")
-        self.container.add_item(self.text)
 
-        self.add_item(self.container)
+        self.container.add_item(
+            self.text
+        )
+
+        self.add_item(
+            self.container
+        )
 
         self.refresh()
 
     def refresh(self):
-        timer = timers.get(self.timer_id)
+        timer = timers.get(
+            self.timer_id
+        )
 
         if not timer:
             self.text.content = (
@@ -1402,14 +1469,14 @@ class TimerView(LayoutView):
             )
         )
 
-        end_text = format_end_time(
+        end_time = format_end_time(
             timer["ends_at"]
         )
 
         self.text.content = (
             f"## {timer['name']}\n\n"
             f"Timer End in `{format_duration(remaining)}`\n"
-            f"End at **{end_text}**"
+            f"End at **{end_time}**"
         )
 
 
@@ -1417,12 +1484,9 @@ async def timer_loop(timer_id):
     while timer_id in timers:
         timer = timers[timer_id]
 
-        channel = bot.get_channel(
-            timer["channel_id"]
-        )
-
-        if not channel:
-            break
+        if timer.get("paused"):
+            await asyncio.sleep(1)
+            continue
 
         remaining = (
             timer["ends_at"]
@@ -1430,27 +1494,45 @@ async def timer_loop(timer_id):
         ).total_seconds()
 
         if remaining <= 0:
-            await send_card(
-                channel,
-                timer["name"],
-                "Timer Ended."
+            channel = bot.get_channel(
+                timer["channel_id"]
             )
 
-            timers.pop(timer_id, None)
-            timer_tasks.pop(timer_id, None)
+            if channel:
+                await send_card(
+                    channel,
+                    timer["name"],
+                    "Timer Ended."
+                )
+
+            timers.pop(
+                timer_id,
+                None
+            )
+
+            timer_tasks.pop(
+                timer_id,
+                None
+            )
+
             break
 
-        try:
-            message = await channel.fetch_message(
-                timer["message_id"]
-            )
+        channel = bot.get_channel(
+            timer["channel_id"]
+        )
 
-            view = TimerView(timer_id)
+        if channel:
+            try:
+                message = await channel.fetch_message(
+                    timer["message_id"]
+                )
 
-            await message.edit(view=view)
+                await message.edit(
+                    view=TimerView(timer_id)
+                )
 
-        except discord.HTTPException:
-            pass
+            except discord.HTTPException:
+                pass
 
         await asyncio.sleep(1)
 
@@ -1467,20 +1549,27 @@ async def tstart(ctx, duration=None, *, name=None):
         return
 
     try:
-        seconds = parse_duration(duration)
-    except ValueError as e:
+        seconds = parse_duration(
+            duration
+        )
+    except ValueError as error:
         await send_card(
             ctx,
             "Timer",
-            str(e)
+            str(error)
         )
         return
 
-    ends_at = discord.utils.utcnow() + timedelta(
-        seconds=seconds
+    ends_at = (
+        discord.utils.utcnow()
+        + timedelta(seconds=seconds)
     )
 
-    timer_id = f"{ctx.guild.id}-{ctx.channel.id}-{ctx.message.id}"
+    timer_id = (
+        f"{ctx.guild.id}-"
+        f"{ctx.channel.id}-"
+        f"{ctx.message.id}"
+    )
 
     timers[timer_id] = {
         "guild_id": ctx.guild.id,
@@ -1492,17 +1581,17 @@ async def tstart(ctx, duration=None, *, name=None):
         "remaining": seconds
     }
 
-    view = TimerView(timer_id)
-
-    message = await ctx.send(view=view)
-
-    timers[timer_id]["message_id"] = message.id
-
-    task = asyncio.create_task(
-        timer_loop(timer_id)
+    message = await ctx.send(
+        view=TimerView(timer_id)
     )
 
-    timer_tasks[timer_id] = task
+    timers[timer_id][
+        "message_id"
+    ] = message.id
+
+    timer_tasks[timer_id] = asyncio.create_task(
+        timer_loop(timer_id)
+    )
 
 
 @bot.command()
@@ -1526,16 +1615,21 @@ async def tend(ctx, *, name):
         )
         return
 
-    timer = timers.pop(timer_id)
-
-    task = timer_tasks.pop(timer_id, None)
+    task = timer_tasks.pop(
+        timer_id,
+        None
+    )
 
     if task:
         task.cancel()
 
+    timer = timers.pop(
+        timer_id
+    )
+
     await send_card(
         ctx,
-        name,
+        timer["name"],
         "Timer ended manually."
     )
 
@@ -1573,7 +1667,12 @@ async def tpause(ctx, *, name):
         )
     )
 
-    task = timer_tasks.pop(timer_id, None)
+    timer["paused"] = True
+
+    task = timer_tasks.pop(
+        timer_id,
+        None
+    )
 
     if task:
         task.cancel()
@@ -1581,12 +1680,15 @@ async def tpause(ctx, *, name):
     await send_card(
         ctx,
         timer["name"],
-        f"Timer paused with `{format_duration(timer['remaining'])}` remaining."
+        (
+            "Timer paused.\n"
+            f"Remaining: `{format_duration(timer['remaining'])}`"
+        )
     )
 
 
 # =========================================================
-# GIVEAWAYS
+# GIVEAWAY
 # =========================================================
 
 class GiveawayJoinButton(Button):
@@ -1594,24 +1696,17 @@ class GiveawayJoinButton(Button):
         super().__init__(
             label="Join Giveaway",
             style=discord.ButtonStyle.secondary,
-            custom_id=f"giveaway_join:{giveaway_id}"
+            custom_id=f"thundernight_giveaway:{giveaway_id}"
         )
 
         self.giveaway_id = giveaway_id
 
     async def callback(self, interaction):
-        giveaway = giveaways.get(self.giveaway_id)
+        giveaway = giveaways.get(
+            self.giveaway_id
+        )
 
         if not giveaway:
-            await send_card(
-                interaction,
-                "Giveaway",
-                "This giveaway no longer exists.",
-                ephemeral=True
-            )
-            return
-
-        if discord.utils.utcnow() >= giveaway["ends_at"]:
             await send_card(
                 interaction,
                 "Giveaway",
@@ -1620,13 +1715,27 @@ class GiveawayJoinButton(Button):
             )
             return
 
-        if interaction.user.id in giveaway_blacklist[
-            interaction.guild.id
-        ]:
+        if (
+            discord.utils.utcnow()
+            >= giveaway["ends_at"]
+        ):
             await send_card(
                 interaction,
                 "Giveaway",
-                "You are blacklisted from this giveaway.",
+                "This giveaway has ended.",
+                ephemeral=True
+            )
+            return
+
+        blacklist = giveaway_blacklist[
+            interaction.guild.id
+        ]
+
+        if interaction.user.id in blacklist:
+            await send_card(
+                interaction,
+                "Giveaway",
+                "You are blacklisted from giveaways.",
                 ephemeral=True
             )
             return
@@ -1660,22 +1769,31 @@ class GiveawayView(LayoutView):
     def __init__(self, giveaway_id):
         super().__init__(timeout=None)
 
-        container = Container()
+        self.giveaway_id = giveaway_id
 
+        self.container = Container()
         self.text = TextDisplay("")
 
-        container.add_item(self.text)
-        container.add_item(Separator())
+        self.container.add_item(
+            self.text
+        )
 
-        container.add_item(
+        self.container.add_item(
+            Separator()
+        )
+
+        self.container.add_item(
             ActionRow(
-                GiveawayJoinButton(giveaway_id)
+                GiveawayJoinButton(
+                    giveaway_id
+                )
             )
         )
 
-        self.add_item(container)
+        self.add_item(
+            self.container
+        )
 
-        self.giveaway_id = giveaway_id
         self.refresh()
 
     def refresh(self):
@@ -1700,7 +1818,7 @@ class GiveawayView(LayoutView):
             )
         )
 
-        end_text = format_end_time(
+        end_time = format_end_time(
             giveaway["ends_at"]
         )
 
@@ -1708,7 +1826,7 @@ class GiveawayView(LayoutView):
             f"## {giveaway['reward']}\n\n"
             f"Winners: `{giveaway['winners']}`\n"
             f"Ends in `{format_duration(remaining)}`\n"
-            f"End at **{end_text}**\n\n"
+            f"End at **{end_time}**\n\n"
             f"Hosted by: {giveaway['host'].mention}\n\n"
             "Click the button below to participate."
         )
@@ -1717,13 +1835,6 @@ class GiveawayView(LayoutView):
 async def giveaway_loop(giveaway_id):
     while giveaway_id in giveaways:
         giveaway = giveaways[giveaway_id]
-
-        channel = bot.get_channel(
-            giveaway["channel_id"]
-        )
-
-        if not channel:
-            break
 
         remaining = (
             giveaway["ends_at"]
@@ -1736,32 +1847,37 @@ async def giveaway_loop(giveaway_id):
             )
             break
 
-        try:
-            message = await channel.fetch_message(
-                giveaway["message_id"]
-            )
+        channel = bot.get_channel(
+            giveaway["channel_id"]
+        )
 
-            await message.edit(
-                view=GiveawayView(giveaway_id)
-            )
+        if channel:
+            try:
+                message = await channel.fetch_message(
+                    giveaway["message_id"]
+                )
 
-        except discord.HTTPException:
-            pass
+                await message.edit(
+                    view=GiveawayView(
+                        giveaway_id
+                    )
+                )
+
+            except discord.HTTPException:
+                pass
 
         await asyncio.sleep(1)
 
 
 async def finish_giveaway(giveaway_id):
-    giveaway = giveaways.get(giveaway_id)
+    giveaway = giveaways.get(
+        giveaway_id
+    )
 
     if not giveaway:
         return
 
-    channel = bot.get_channel(
-        giveaway["channel_id"]
-    )
-
-    entries = [
+    eligible_entries = [
         user_id
         for user_id in giveaway["entries"]
         if user_id not in giveaway_blacklist[
@@ -1771,16 +1887,15 @@ async def finish_giveaway(giveaway_id):
 
     winner_count = min(
         giveaway["winners"],
-        len(entries)
+        len(eligible_entries)
     )
 
-    winners = (
-        random.sample(entries, winner_count)
-        if winner_count
-        else []
-    )
+    if winner_count:
+        winners = random.sample(
+            eligible_entries,
+            winner_count
+        )
 
-    if winners:
         winner_text = "\n".join(
             f"<@{user_id}>"
             for user_id in winners
@@ -1788,14 +1903,18 @@ async def finish_giveaway(giveaway_id):
     else:
         winner_text = "No eligible winners."
 
+    channel = bot.get_channel(
+        giveaway["channel_id"]
+    )
+
     if channel:
         await send_card(
             channel,
             giveaway["reward"],
             (
-                f"Giveaway ended.\n\n"
+                "Giveaway ended.\n\n"
                 f"Winners:\n{winner_text}\n\n"
-                f"Total entries: `{len(entries)}`"
+                f"Entries: `{len(eligible_entries)}`"
             )
         )
 
@@ -1805,13 +1924,22 @@ async def finish_giveaway(giveaway_id):
             )
 
             await message.edit(
-                view=LayoutView(timeout=None)
+                view=make_card(
+                    giveaway["reward"],
+                    (
+                        "Giveaway ended.\n\n"
+                        f"Winners:\n{winner_text}"
+                    )
+                )
             )
 
         except discord.HTTPException:
             pass
 
-    giveaways.pop(giveaway_id, None)
+    giveaways.pop(
+        giveaway_id,
+        None
+    )
 
     task = giveaway_tasks.pop(
         giveaway_id,
@@ -1834,12 +1962,14 @@ async def gstart(ctx, duration=None, winners: int = None, *, reward=None):
         return
 
     try:
-        seconds = parse_duration(duration)
-    except ValueError as e:
+        seconds = parse_duration(
+            duration
+        )
+    except ValueError as error:
         await send_card(
             ctx,
             "Giveaway",
-            str(e)
+            str(error)
         )
         return
 
@@ -1851,12 +1981,13 @@ async def gstart(ctx, duration=None, winners: int = None, *, reward=None):
         )
         return
 
-    ends_at = discord.utils.utcnow() + timedelta(
-        seconds=seconds
-    )
-
     giveaway_id = str(
         ctx.message.id
+    )
+
+    ends_at = (
+        discord.utils.utcnow()
+        + timedelta(seconds=seconds)
     )
 
     giveaways[giveaway_id] = {
@@ -1870,23 +2001,19 @@ async def gstart(ctx, duration=None, winners: int = None, *, reward=None):
         "entries": set()
     }
 
-    view = GiveawayView(
-        giveaway_id
-    )
-
     message = await ctx.send(
-        view=view
+        view=GiveawayView(
+            giveaway_id
+        )
     )
 
     giveaways[giveaway_id][
         "message_id"
     ] = message.id
 
-    task = asyncio.create_task(
+    giveaway_tasks[giveaway_id] = asyncio.create_task(
         giveaway_loop(giveaway_id)
     )
-
-    giveaway_tasks[giveaway_id] = task
 
 
 @bot.command()
@@ -1920,40 +2047,50 @@ async def gblacklist(ctx, member: discord.Member):
     ]
 
     if member.id in blacklist:
-        blacklist.remove(member.id)
+        blacklist.remove(
+            member.id
+        )
 
         await send_card(
             ctx,
             "Giveaway Blacklist",
-            f"{member.mention} has been removed from the giveaway blacklist."
+            f"{member.mention} has been removed from the blacklist."
         )
-        return
 
-    blacklist.add(member.id)
+    else:
+        blacklist.add(
+            member.id
+        )
 
-    for giveaway in giveaways.values():
-        if giveaway["guild_id"] == ctx.guild.id:
-            giveaway["entries"].discard(
-                member.id
-            )
+        for giveaway in giveaways.values():
+            if giveaway["guild_id"] == ctx.guild.id:
+                giveaway["entries"].discard(
+                    member.id
+                )
 
-    await send_card(
-        ctx,
-        "Giveaway Blacklist",
-        f"{member.mention} has been added to the giveaway blacklist."
-    )
+        await send_card(
+            ctx,
+            "Giveaway Blacklist",
+            f"{member.mention} has been added to the blacklist."
+        )
 
 
 # =========================================================
-# COMMAND ERROR HANDLER
+# ERROR HANDLER
 # =========================================================
 
 @bot.event
 async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
+    if isinstance(
+        error,
+        commands.CommandNotFound
+    ):
         return
 
-    if isinstance(error, commands.CheckFailure):
+    if isinstance(
+        error,
+        commands.CheckFailure
+    ):
         await send_card(
             ctx,
             "Permission Denied",
@@ -1961,7 +2098,10 @@ async def on_command_error(ctx, error):
         )
         return
 
-    if isinstance(error, commands.MissingRequiredArgument):
+    if isinstance(
+        error,
+        commands.MissingRequiredArgument
+    ):
         await send_card(
             ctx,
             "Missing Argument",
@@ -1969,7 +2109,10 @@ async def on_command_error(ctx, error):
         )
         return
 
-    if isinstance(error, commands.BadArgument):
+    if isinstance(
+        error,
+        commands.BadArgument
+    ):
         await send_card(
             ctx,
             "Invalid Argument",
@@ -1977,11 +2120,12 @@ async def on_command_error(ctx, error):
         )
         return
 
-    if isinstance(error, commands.CommandInvokeError):
-        original = error.original
-
+    if isinstance(
+        error,
+        commands.CommandInvokeError
+    ):
         if isinstance(
-            original,
+            error.original,
             discord.Forbidden
         ):
             await send_card(
@@ -1995,7 +2139,7 @@ async def on_command_error(ctx, error):
 
 
 # =========================================================
-# START
+# RUN
 # =========================================================
 
 bot.run(TOKEN)
