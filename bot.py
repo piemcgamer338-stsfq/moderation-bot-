@@ -1,5 +1,6 @@
 import os
 import re
+import random
 import asyncio
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
@@ -31,6 +32,7 @@ intents.guilds = True
 intents.members = True
 intents.message_content = True
 intents.messages = True
+intents.presences = True
 
 bot = commands.Bot(
     command_prefix=PREFIX,
@@ -40,8 +42,8 @@ bot = commands.Bot(
 
 
 # =========================================================
-# IN-MEMORY DATA
-# RESETS WHEN BOT RESTARTS
+# IN-MEMORY STORAGE
+# EVERYTHING RESETS WHEN BOT RESTARTS
 # =========================================================
 
 guild_settings = {}
@@ -76,9 +78,16 @@ snipes = defaultdict(
     )
 )
 
+timers = defaultdict(dict)
+
+giveaways = {}
+giveaway_tasks = {}
+
+giveaway_blacklist = defaultdict(set)
+
 
 # =========================================================
-# SETTINGS
+# DEFAULT SETTINGS
 # =========================================================
 
 def default_settings():
@@ -88,6 +97,7 @@ def default_settings():
             "delafter": 3,
             "channels": []
         },
+
         "welcome": {
             "message": (
                 "Welcome {member_mention} to {server_name}.\n\n"
@@ -95,6 +105,7 @@ def default_settings():
             ),
             "channel": None
         },
+
         "level": {
             "channel": None,
             "message": (
@@ -110,6 +121,88 @@ def get_settings(guild_id):
         guild_settings[guild_id] = default_settings()
 
     return guild_settings[guild_id]
+
+
+# =========================================================
+# GENERAL HELPERS
+# =========================================================
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def format_duration(seconds):
+    seconds = int(seconds)
+
+    if seconds < 60:
+        return f"{seconds} second{'s' if seconds != 1 else ''}"
+
+    minutes = seconds // 60
+
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+
+    hours = minutes // 60
+    minutes %= 60
+
+    if hours < 24:
+        if minutes:
+            return f"{hours}h {minutes}m"
+        return f"{hours} hour{'s' if hours != 1 else ''}"
+
+    days = hours // 24
+    hours %= 24
+
+    if hours:
+        return f"{days}d {hours}h"
+
+    return f"{days} day{'s' if days != 1 else ''}"
+
+
+def parse_duration(value):
+    if not value:
+        return None
+
+    value = value.lower().strip()
+
+    match = re.fullmatch(
+        r"(\d+)\s*(s|m|h|d|w)",
+        value
+    )
+
+    if not match:
+        return None
+
+    amount = int(match.group(1))
+    unit = match.group(2)
+
+    multipliers = {
+        "s": 1,
+        "m": 60,
+        "h": 3600,
+        "d": 86400,
+        "w": 604800
+    }
+
+    return amount * multipliers[unit]
+
+
+def parse_giveaway_duration(value):
+    return parse_duration(value)
+
+
+def format_discord_time(dt):
+    return discord.utils.format_dt(
+        dt,
+        "F"
+    )
+
+
+def format_discord_relative(dt):
+    return discord.utils.format_dt(
+        dt,
+        "R"
+    )
 
 
 # =========================================================
@@ -153,13 +246,13 @@ def replace_variables(
     if guild is None and member:
         guild = member.guild
 
-    now = datetime.now(timezone.utc)
+    current_time = now_utc()
 
     values = {
-        "date": now.strftime("%d/%m/%Y"),
-        "time": now.strftime("%I:%M %p"),
-        "timestamp": discord.utils.format_dt(now, "F"),
-        "timestamp_relative": discord.utils.format_dt(now, "R")
+        "date": current_time.strftime("%d/%m/%Y"),
+        "time": current_time.strftime("%I:%M %p"),
+        "timestamp": format_discord_time(current_time),
+        "timestamp_relative": format_discord_relative(current_time)
     }
 
     if member:
@@ -169,27 +262,23 @@ def replace_variables(
             "member_mention": member.mention,
             "member_id": str(member.id),
             "member_nick": member.display_name,
-            "member_created": discord.utils.format_dt(
-                member.created_at,
-                "F"
+
+            "member_created": format_discord_time(
+                member.created_at
             ),
-            "member_created_relative": discord.utils.format_dt(
-                member.created_at,
-                "R"
+
+            "member_created_relative": format_discord_relative(
+                member.created_at
             ),
+
             "member_jointime": (
-                discord.utils.format_dt(
-                    member.joined_at,
-                    "F"
-                )
+                format_discord_time(member.joined_at)
                 if member.joined_at
                 else "Unknown"
             ),
+
             "member_jointime_relative": (
-                discord.utils.format_dt(
-                    member.joined_at,
-                    "R"
-                )
+                format_discord_relative(member.joined_at)
                 if member.joined_at
                 else "Unknown"
             )
@@ -201,23 +290,25 @@ def replace_variables(
             "server_name": guild.name,
             "server_id": str(guild.id),
             "server_members": str(guild.member_count or 0),
+
             "server_owner": (
                 guild.owner.mention
                 if guild.owner
                 else "Unknown"
             ),
+
             "server_owner_name": (
                 guild.owner.name
                 if guild.owner
                 else "Unknown"
             ),
-            "server_created": discord.utils.format_dt(
-                guild.created_at,
-                "F"
+
+            "server_created": format_discord_time(
+                guild.created_at
             ),
-            "server_created_relative": discord.utils.format_dt(
-                guild.created_at,
-                "R"
+
+            "server_created_relative": format_discord_relative(
+                guild.created_at
             )
         })
 
@@ -238,263 +329,7 @@ def replace_variables(
 
 
 # =========================================================
-# HELP MODULES
-# =========================================================
-
-MODULES = {
-    "moderation": {
-        "name": "Moderation",
-        "commands": [
-            (".ban @user", "Ban a member."),
-            (".kick @user", "Kick a member."),
-            (".mute @user 1h", "Temporarily mute a member."),
-            (".lock", "Lock the current channel."),
-            (".unlock", "Unlock the current channel."),
-            (".hide", "Hide the current channel."),
-            (".unhide", "Unhide the current channel."),
-            (".unban userid", "Unban a user."),
-            (".nuke", "Delete the channel and recreate it."),
-            (".clone", "Clone the current channel."),
-            (".purge amount", "Delete messages."),
-            (".snipe", "Show the latest deleted message.")
-        ]
-    },
-    "greet": {
-        "name": "Greet",
-        "commands": [
-            (".greet delafter seconds", "Set deletion time."),
-            (".greet message message", "Set the greet message."),
-            (".greet variables", "Show greet variables."),
-            (".greet setchannel #channel", "Add a greet channel."),
-            (".greet removechannel #channel", "Remove a greet channel."),
-            (".greet reset", "Reset greet settings.")
-        ]
-    },
-    "welcome": {
-        "name": "Welcome",
-        "commands": [
-            (".welcome channel #channel", "Set the welcome channel."),
-            (".welcome message message", "Set the welcome message."),
-            (".welcome variables", "Show welcome variables."),
-            (".welcome reset", "Reset welcome settings.")
-        ]
-    },
-    "level": {
-        "name": "Level",
-        "commands": [
-            (".lvl", "Show your level."),
-            (".lvl @user", "Show another user's level."),
-            (".level channel #channel", "Set level-up channel."),
-            (".level lb", "Show the top 3 users."),
-            (".level lbreset", "Reset level data."),
-            (".lvl message message", "Set level-up message."),
-            (".lvl variables", "Show level variables.")
-        ]
-    },
-    "invites": {
-        "name": "Invites",
-        "commands": [
-            (".i", "Show invite statistics."),
-            (".i @user", "Show another user's statistics."),
-            (".lb i", "Show the top 10 inviters."),
-            (".lbreset", "Reset invite statistics.")
-        ]
-    }
-}
-
-
-# =========================================================
-# COMPONENTS V2 HELP
-# =========================================================
-
-def text_display(content):
-    return discord.ui.TextDisplay(content=content)
-
-
-class HelpSelect(discord.ui.Select):
-
-    def __init__(self, author_id):
-        self.author_id = author_id
-
-        options = [
-            discord.SelectOption(
-                label=data["name"],
-                value=key,
-                description=f"View {data['name']} commands"
-            )
-            for key, data in MODULES.items()
-        ]
-
-        super().__init__(
-            placeholder="Select a module",
-            min_values=1,
-            max_values=1,
-            options=options
-        )
-
-    async def callback(self, interaction):
-
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "This help menu belongs to another user.",
-                ephemeral=True
-            )
-            return
-
-        key = self.values[0]
-
-        await interaction.response.edit_message(
-            view=HelpLayout(
-                self.author_id,
-                selected=key
-            )
-        )
-
-
-class HelpBack(discord.ui.Button):
-
-    def __init__(self, author_id):
-        self.author_id = author_id
-
-        super().__init__(
-            label="Back",
-            style=discord.ButtonStyle.secondary
-        )
-
-    async def callback(self, interaction):
-
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "This help menu belongs to another user.",
-                ephemeral=True
-            )
-            return
-
-        await interaction.response.edit_message(
-            view=HelpLayout(self.author_id)
-        )
-
-
-class HelpLayout(discord.ui.LayoutView):
-
-    def __init__(
-        self,
-        author_id,
-        selected=None
-    ):
-        super().__init__(timeout=180)
-
-        self.author_id = author_id
-        self.selected = selected
-
-        container = discord.ui.Container()
-
-        if selected is None:
-
-            container.add_item(
-                discord.ui.TextDisplay(
-                    content=(
-                        "## Hey, I'm Dream Land Security\n\n"
-                        f"**My prefix for this server is** `{PREFIX}`\n\n"
-                        f"**Type** `{PREFIX}help [context]` "
-                        "**for more**\n\n"
-                        f"**Total commands:** "
-                        f"{sum(len(x['commands']) for x in MODULES.values())}\n\n"
-                        "`»` Moderation\n"
-                        "`»` Greet\n"
-                        "`»` Welcome\n"
-                        "`»` Level\n"
-                        "`»` Invites\n\n"
-                        "**Select a module to see**"
-                    )
-                )
-            )
-
-        else:
-
-            module = MODULES[selected]
-
-            command_lines = []
-
-            for command, description in module["commands"]:
-                command_lines.append(
-                    f"**`{command}`**\n{description}"
-                )
-
-            container.add_item(
-                discord.ui.TextDisplay(
-                    content=(
-                        f"## {module['name']}\n\n"
-                        + "\n\n".join(command_lines)
-                    )
-                )
-            )
-
-        container.add_item(
-            discord.ui.Separator(
-                visible=True
-            )
-        )
-
-        container.add_item(
-            discord.ui.ActionRow(
-                HelpSelect(author_id)
-            )
-        )
-
-        if selected is not None:
-            container.add_item(
-                discord.ui.ActionRow(
-                    HelpBack(author_id)
-                )
-            )
-
-        self.add_item(container)
-
-
-@bot.command(name="help")
-async def help_command(
-    ctx,
-    context=None
-):
-
-    if context:
-
-        aliases = {
-            "mod": "moderation",
-            "moderation": "moderation",
-            "greet": "greet",
-            "welcome": "welcome",
-            "level": "level",
-            "lvl": "level",
-            "invite": "invites",
-            "invites": "invites",
-            "i": "invites"
-        }
-
-        key = aliases.get(
-            context.lower()
-        )
-
-        if key:
-
-            await ctx.send(
-                view=HelpLayout(
-                    ctx.author.id,
-                    selected=key
-                )
-            )
-            return
-
-    await ctx.send(
-        view=HelpLayout(
-            ctx.author.id
-        )
-    )
-
-
-# =========================================================
-# PERMISSION HELPERS
+# PERMISSION CHECKS
 # =========================================================
 
 def is_admin():
@@ -518,6 +353,320 @@ def has_manage_messages():
 
 
 # =========================================================
+# HELP MODULES
+# =========================================================
+
+MODULES = {
+    "moderation": {
+        "name": "Moderation",
+        "commands": [
+            (".ban @user", "Ban a member."),
+            (".kick @user", "Kick a member."),
+            (".mute @user 1h", "Temporarily mute a member."),
+            (".lock", "Lock the current channel."),
+            (".unlock", "Unlock the current channel."),
+            (".hide", "Hide the current channel."),
+            (".unhide", "Unhide the current channel."),
+            (".unban userid", "Unban a user by ID."),
+            (".nuke", "Delete and recreate the current channel."),
+            (".clone", "Clone the current channel."),
+            (".purge amount", "Delete a number of messages."),
+            (".snipe", "Show the latest deleted message.")
+        ]
+    },
+
+    "greet": {
+        "name": "Greet",
+        "commands": [
+            (".greet delafter seconds", "Set greeting deletion time."),
+            (".greet message message", "Set the greeting message."),
+            (".greet variables", "Show greeting variables."),
+            (".greet setchannel #channel", "Add a greeting channel."),
+            (".greet removechannel #channel", "Remove a greeting channel."),
+            (".greet reset", "Reset greeting settings.")
+        ]
+    },
+
+    "welcome": {
+        "name": "Welcome",
+        "commands": [
+            (".welcome channel #channel", "Set the welcome channel."),
+            (".welcome message message", "Set the welcome message."),
+            (".welcome variables", "Show welcome variables."),
+            (".welcome reset", "Reset welcome settings.")
+        ]
+    },
+
+    "level": {
+        "name": "Level",
+        "commands": [
+            (".lvl", "Show your level."),
+            (".lvl @user", "Show another user's level."),
+            (".level channel #channel", "Set the level-up channel."),
+            (".level lb", "Show the top 3 users."),
+            (".level lbreset", "Reset all level data."),
+            (".lvl message message", "Set the level-up message."),
+            (".lvl variables", "Show level variables.")
+        ]
+    },
+
+    "invites": {
+        "name": "Invites",
+        "commands": [
+            (".i", "Show invite statistics."),
+            (".i @user", "Show another user's invite statistics."),
+            (".lb i", "Show the top 10 inviters."),
+            (".lbreset", "Reset invite statistics.")
+        ]
+    },
+
+    "general": {
+        "name": "General",
+        "commands": [
+            (".avatar [user]", "Show a user's avatar."),
+            (".banner [user]", "Show a user's banner."),
+            (".srvlogo", "Show the server icon."),
+            (".srvbanner", "Show the server banner."),
+            (".profile", "Show your profile."),
+            (".si", "Show server information."),
+            (".tstart 1h name", "Start a named timer."),
+            (".tend name", "End a named timer."),
+            (".tpause name", "Pause a named timer.")
+        ]
+    },
+
+    "giveaway": {
+        "name": "Giveaway",
+        "commands": [
+            (".gstart 1h 1 reward", "Start a giveaway."),
+            (".gend message_id", "End a giveaway."),
+            (".gblacklist @user", "Blacklist a user from giveaways.")
+        ]
+    }
+}
+
+
+# =========================================================
+# COMPONENTS V2 HELP
+# =========================================================
+
+class HelpSelect(discord.ui.Select):
+
+    def __init__(self, author_id, selected=None):
+        self.author_id = author_id
+
+        options = []
+
+        for key, module in MODULES.items():
+
+            options.append(
+                discord.SelectOption(
+                    label=module["name"],
+                    value=key,
+                    description=f"View {module['name']} commands",
+                    default=key == selected
+                )
+            )
+
+        super().__init__(
+            placeholder="Select a module",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction):
+
+        if interaction.user.id != self.author_id:
+
+            await interaction.response.send_message(
+                "This help menu belongs to another user.",
+                ephemeral=True
+            )
+
+            return
+
+        selected = self.values[0]
+
+        await interaction.response.edit_message(
+            view=HelpLayout(
+                self.author_id,
+                selected
+            )
+        )
+
+
+class HelpBack(discord.ui.Button):
+
+    def __init__(self, author_id):
+        self.author_id = author_id
+
+        super().__init__(
+            label="Back",
+            style=discord.ButtonStyle.secondary
+        )
+
+    async def callback(self, interaction):
+
+        if interaction.user.id != self.author_id:
+
+            await interaction.response.send_message(
+                "This help menu belongs to another user.",
+                ephemeral=True
+            )
+
+            return
+
+        await interaction.response.edit_message(
+            view=HelpLayout(
+                self.author_id
+            )
+        )
+
+
+class HelpLayout(discord.ui.LayoutView):
+
+    def __init__(
+        self,
+        author_id,
+        selected=None
+    ):
+        super().__init__(
+            timeout=180
+        )
+
+        self.author_id = author_id
+        self.selected = selected
+
+        container = discord.ui.Container()
+
+        if selected is None:
+
+            total_commands = sum(
+                len(module["commands"])
+                for module in MODULES.values()
+            )
+
+            content = (
+                "## Hey, I'm Dream Land Security\n\n"
+                f"**My prefix for this server is** `{PREFIX}`\n\n"
+                f"**Type** `{PREFIX}help [context]` **for more**\n\n"
+                f"**Total commands:** `{total_commands}`\n\n"
+                "`»` Moderation\n"
+                "`»` Greet\n"
+                "`»` Welcome\n"
+                "`»` Level\n"
+                "`»` Invites\n"
+                "`»` General\n"
+                "`»` Giveaway\n\n"
+                "**Select a module to see**"
+            )
+
+        else:
+
+            module = MODULES[selected]
+
+            command_lines = []
+
+            for command, description in module["commands"]:
+
+                command_lines.append(
+                    f"**`{command}`**\n{description}"
+                )
+
+            content = (
+                f"## {module['name']}\n\n"
+                + "\n\n".join(command_lines)
+            )
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                content=content
+            )
+        )
+
+        container.add_item(
+            discord.ui.Separator(
+                visible=True
+            )
+        )
+
+        container.add_item(
+            discord.ui.ActionRow(
+                HelpSelect(
+                    author_id,
+                    selected
+                )
+            )
+        )
+
+        if selected is not None:
+
+            container.add_item(
+                discord.ui.ActionRow(
+                    HelpBack(
+                        author_id
+                    )
+                )
+            )
+
+        self.add_item(container)
+
+
+@bot.command(name="help")
+async def help_command(
+    ctx,
+    context=None
+):
+
+    if context:
+
+        aliases = {
+            "mod": "moderation",
+            "moderation": "moderation",
+
+            "greet": "greet",
+
+            "welcome": "welcome",
+
+            "level": "level",
+            "lvl": "level",
+
+            "invite": "invites",
+            "invites": "invites",
+            "i": "invites",
+
+            "general": "general",
+            "gen": "general",
+
+            "giveaway": "giveaway",
+            "giveaways": "giveaway",
+            "give": "giveaway"
+        }
+
+        selected = aliases.get(
+            context.lower()
+        )
+
+        if selected:
+
+            await ctx.send(
+                view=HelpLayout(
+                    ctx.author.id,
+                    selected
+                )
+            )
+
+            return
+
+    await ctx.send(
+        view=HelpLayout(
+            ctx.author.id
+        )
+    )
+
+
+# =========================================================
 # MODERATION
 # =========================================================
 
@@ -531,13 +680,17 @@ async def ban(
 ):
 
     try:
-        await member.ban(reason=reason)
+
+        await member.ban(
+            reason=reason
+        )
 
         await ctx.send(
             f"Member **{member}** has been banned."
         )
 
     except discord.Forbidden:
+
         await ctx.send(
             "I don't have permission to ban that member."
         )
@@ -553,40 +706,20 @@ async def kick(
 ):
 
     try:
-        await member.kick(reason=reason)
+
+        await member.kick(
+            reason=reason
+        )
 
         await ctx.send(
             f"Member **{member}** has been kicked."
         )
 
     except discord.Forbidden:
+
         await ctx.send(
             "I don't have permission to kick that member."
         )
-
-
-def parse_duration(value):
-
-    match = re.fullmatch(
-        r"(\d+)(s|m|h|d|w)",
-        value.lower()
-    )
-
-    if not match:
-        return None
-
-    amount = int(match.group(1))
-    unit = match.group(2)
-
-    multipliers = {
-        "s": 1,
-        "m": 60,
-        "h": 3600,
-        "d": 86400,
-        "w": 604800
-    }
-
-    return amount * multipliers[unit]
 
 
 @bot.command()
@@ -599,27 +732,36 @@ async def mute(
     reason="No reason provided"
 ):
 
-    if duration is None:
+    if not duration:
+
         await ctx.send(
             "Usage: `.mute @user 1h`"
         )
+
         return
 
-    seconds = parse_duration(duration)
+    seconds = parse_duration(
+        duration
+    )
 
     if seconds is None:
+
         await ctx.send(
             "Invalid duration. Use `1m`, `1h`, `1d` or `1w`."
         )
+
         return
 
     if seconds > 28 * 86400:
+
         await ctx.send(
             "The maximum timeout is 28 days."
         )
+
         return
 
     try:
+
         await member.timeout(
             timedelta(seconds=seconds),
             reason=reason
@@ -631,6 +773,7 @@ async def mute(
         )
 
     except discord.Forbidden:
+
         await ctx.send(
             "I don't have permission to mute that member."
         )
@@ -651,7 +794,9 @@ async def lock(ctx):
         overwrite=overwrite
     )
 
-    await ctx.send("Channel locked.")
+    await ctx.send(
+        "Channel locked."
+    )
 
 
 @bot.command()
@@ -669,7 +814,9 @@ async def unlock(ctx):
         overwrite=overwrite
     )
 
-    await ctx.send("Channel unlocked.")
+    await ctx.send(
+        "Channel unlocked."
+    )
 
 
 @bot.command()
@@ -687,7 +834,9 @@ async def hide(ctx):
         overwrite=overwrite
     )
 
-    await ctx.send("Channel hidden.")
+    await ctx.send(
+        "Channel hidden."
+    )
 
 
 @bot.command()
@@ -705,28 +854,40 @@ async def unhide(ctx):
         overwrite=overwrite
     )
 
-    await ctx.send("Channel visible.")
+    await ctx.send(
+        "Channel visible."
+    )
 
 
 @bot.command()
 @is_admin()
-async def unban(ctx, user_id: int):
+async def unban(
+    ctx,
+    user_id: int
+):
 
     try:
-        user = await bot.fetch_user(user_id)
 
-        await ctx.guild.unban(user)
+        user = await bot.fetch_user(
+            user_id
+        )
+
+        await ctx.guild.unban(
+            user
+        )
 
         await ctx.send(
             f"User **{user}** has been unbanned."
         )
 
     except discord.NotFound:
+
         await ctx.send(
             "User is not banned or does not exist."
         )
 
     except discord.Forbidden:
+
         await ctx.send(
             "I don't have permission to unban users."
         )
@@ -757,6 +918,7 @@ async def nuke(ctx):
         )
 
     except discord.Forbidden:
+
         await ctx.send(
             "I don't have permission to nuke this channel."
         )
@@ -787,6 +949,7 @@ async def clone(ctx):
         )
 
     except discord.Forbidden:
+
         await ctx.send(
             "I don't have permission to clone this channel."
         )
@@ -794,18 +957,25 @@ async def clone(ctx):
 
 @bot.command()
 @is_admin()
-async def purge(ctx, amount: int):
+async def purge(
+    ctx,
+    amount: int
+):
 
     if amount < 1:
+
         await ctx.send(
             "Amount must be greater than zero."
         )
+
         return
 
     if amount > 1000:
+
         await ctx.send(
             "Maximum purge amount is 1000."
         )
+
         return
 
     deleted = await ctx.channel.purge(
@@ -840,9 +1010,11 @@ async def snipe(ctx):
     ]
 
     if not messages:
+
         await ctx.send(
             "There is no deleted message to show."
         )
+
         return
 
     data = messages[-1]
@@ -854,7 +1026,7 @@ async def snipe(ctx):
 
 
 # =========================================================
-# DELETE MESSAGE SNIPE
+# SNIPE EVENT
 # =========================================================
 
 @bot.event
@@ -900,9 +1072,11 @@ async def greet_delafter(
 ):
 
     if seconds < 0:
+
         await ctx.send(
             "Seconds cannot be negative."
         )
+
         return
 
     get_settings(
@@ -956,16 +1130,20 @@ async def greet_setchannel(
     )["greet"]
 
     if channel.id in settings["channels"]:
+
         await ctx.send(
             "That channel is already configured."
         )
+
         return
 
     if len(settings["channels"]) >= MAX_GREET_CHANNELS:
+
         await ctx.send(
             f"You can only have {MAX_GREET_CHANNELS} "
             f"greet channels."
         )
+
         return
 
     settings["channels"].append(
@@ -989,9 +1167,11 @@ async def greet_removechannel(
     )["greet"]
 
     if channel.id not in settings["channels"]:
+
         await ctx.send(
             "That channel is not configured."
         )
+
         return
 
     settings["channels"].remove(
@@ -1109,9 +1289,10 @@ async def lvl(
     ]
 
     current = data["messages"]
-    level = data["level"]
+    level_value = data["level"]
 
     progress = current % MESSAGES_PER_LEVEL
+
     remaining = (
         MESSAGES_PER_LEVEL - progress
         if progress
@@ -1120,7 +1301,7 @@ async def lvl(
 
     await ctx.send(
         f"**{member.display_name}**\n"
-        f"Level: **{level}**\n"
+        f"Level: **{level_value}**\n"
         f"Messages: **{current}**\n"
         f"Next level: **{remaining}** messages"
     )
@@ -1169,6 +1350,7 @@ async def level_lb(ctx):
         )
 
         if member:
+
             entries.append(
                 (
                     member,
@@ -1188,12 +1370,17 @@ async def level_lb(ctx):
     entries = entries[:3]
 
     if not entries:
+
         await ctx.send(
             "No level data yet."
         )
+
         return
 
-    lines = []
+    lines = [
+        "**Level Leaderboard**",
+        ""
+    ]
 
     for position, (
         member,
@@ -1304,7 +1491,7 @@ async def invite_info(
         f"Fake: **{data['fakes']}**\n"
         f"Rejoins: **{data['rejoins']}**\n\n"
         f"Requested by {ctx.author.mention} "
-        f"• {discord.utils.format_dt(datetime.now(timezone.utc), 'R')}"
+        f"• {discord.utils.format_dt(now_utc(), 'R')}"
     )
 
 
@@ -1333,6 +1520,7 @@ async def invite_lb(ctx):
         )
 
         if member:
+
             entries.append(
                 (
                     member,
@@ -1351,9 +1539,11 @@ async def invite_lb(ctx):
     entries = entries[:10]
 
     if not entries:
+
         await ctx.send(
             "No invite data yet."
         )
+
         return
 
     lines = [
@@ -1399,10 +1589,972 @@ async def lbreset(ctx):
 
 
 # =========================================================
+# GENERAL
+# =========================================================
+
+@bot.command(name="avatar")
+async def avatar(
+    ctx,
+    member: discord.Member = None
+):
+
+    member = member or ctx.author
+
+    embed = discord.Embed(
+        title=f"{member.display_name}'s Avatar"
+    )
+
+    embed.set_image(
+        url=member.display_avatar.url
+    )
+
+    await ctx.send(
+        embed=embed
+    )
+
+
+@bot.command(name="banner")
+async def banner(
+    ctx,
+    member: discord.Member = None
+):
+
+    member = member or ctx.author
+
+    try:
+
+        user = await bot.fetch_user(
+            member.id
+        )
+
+        if not user.banner:
+
+            await ctx.send(
+                "This user does not have a banner."
+            )
+
+            return
+
+        embed = discord.Embed(
+            title=f"{member.display_name}'s Banner"
+        )
+
+        embed.set_image(
+            url=user.banner.url
+        )
+
+        await ctx.send(
+            embed=embed
+        )
+
+    except discord.HTTPException:
+
+        await ctx.send(
+            "Unable to fetch this user's banner."
+        )
+
+
+@bot.command(name="srvlogo")
+async def srvlogo(ctx):
+
+    if not ctx.guild.icon:
+
+        await ctx.send(
+            "This server does not have a server icon."
+        )
+
+        return
+
+    embed = discord.Embed(
+        title=f"{ctx.guild.name} Logo"
+    )
+
+    embed.set_image(
+        url=ctx.guild.icon.url
+    )
+
+    await ctx.send(
+        embed=embed
+    )
+
+
+@bot.command(name="srvbanner")
+async def srvbanner(ctx):
+
+    if not ctx.guild.banner:
+
+        await ctx.send(
+            "This server does not have a server banner."
+        )
+
+        return
+
+    embed = discord.Embed(
+        title=f"{ctx.guild.name} Banner"
+    )
+
+    embed.set_image(
+        url=ctx.guild.banner.url
+    )
+
+    await ctx.send(
+        embed=embed
+    )
+
+
+@bot.command(name="profile")
+async def profile(ctx):
+
+    member = ctx.author
+
+    roles = [
+        role.mention
+        for role in member.roles[1:]
+    ]
+
+    role_text = (
+        ", ".join(roles)
+        if roles
+        else "None"
+    )
+
+    embed = discord.Embed(
+        title=f"{member.display_name}'s Profile"
+    )
+
+    embed.set_thumbnail(
+        url=member.display_avatar.url
+    )
+
+    embed.add_field(
+        name="Username",
+        value=str(member),
+        inline=False
+    )
+
+    embed.add_field(
+        name="User ID",
+        value=str(member.id),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Account Created",
+        value=format_discord_time(
+            member.created_at
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Joined Server",
+        value=(
+            format_discord_time(member.joined_at)
+            if member.joined_at
+            else "Unknown"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Roles",
+        value=role_text,
+        inline=False
+    )
+
+    await ctx.send(
+        embed=embed
+    )
+
+
+@bot.command(name="si")
+async def server_info(ctx):
+
+    guild = ctx.guild
+
+    embed = discord.Embed(
+        title=f"{guild.name} Server Information"
+    )
+
+    if guild.icon:
+        embed.set_thumbnail(
+            url=guild.icon.url
+        )
+
+    embed.add_field(
+        name="Server ID",
+        value=str(guild.id),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Owner",
+        value=(
+            guild.owner.mention
+            if guild.owner
+            else "Unknown"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Members",
+        value=str(
+            guild.member_count or 0
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="Channels",
+        value=str(
+            len(guild.channels)
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="Roles",
+        value=str(
+            len(guild.roles)
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="Created",
+        value=format_discord_time(
+            guild.created_at
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Verification Level",
+        value=str(
+            guild.verification_level
+        ),
+        inline=False
+    )
+
+    await ctx.send(
+        embed=embed
+    )
+
+
+# =========================================================
+# TIMERS
+# =========================================================
+
+async def timer_runner(
+    guild_id,
+    timer_name
+):
+
+    timer = timers[
+        guild_id
+    ].get(
+        timer_name
+    )
+
+    if not timer:
+        return
+
+    while True:
+
+        if timer["paused"]:
+            await asyncio.sleep(1)
+            continue
+
+        remaining = (
+            timer["end_at"]
+            - now_utc()
+        ).total_seconds()
+
+        if remaining <= 0:
+            break
+
+        await asyncio.sleep(
+            min(
+                remaining,
+                1
+            )
+        )
+
+        if timer_name not in timers[guild_id]:
+            return
+
+        timer = timers[
+            guild_id
+        ].get(
+            timer_name
+        )
+
+        if not timer:
+            return
+
+    if timer_name not in timers[guild_id]:
+        return
+
+    timer = timers[
+        guild_id
+    ].pop(
+        timer_name,
+        None
+    )
+
+    if timer:
+
+        channel = bot.get_channel(
+            timer["channel_id"]
+        )
+
+        if channel:
+
+            try:
+
+                await channel.send(
+                    f"Timer **{timer_name}** has ended."
+                )
+
+            except discord.HTTPException:
+                pass
+
+    giveaway_tasks.pop(
+        f"timer:{guild_id}:{timer_name}",
+        None
+    )
+
+
+@bot.command(name="tstart")
+@is_admin()
+async def timer_start(
+    ctx,
+    duration,
+    *,
+    name
+):
+
+    seconds = parse_duration(
+        duration
+    )
+
+    if seconds is None:
+
+        await ctx.send(
+            "Invalid duration. Example: `.tstart 1h name`"
+        )
+
+        return
+
+    if seconds <= 0:
+
+        await ctx.send(
+            "Duration must be greater than zero."
+        )
+
+        return
+
+    if name in timers[
+        ctx.guild.id
+    ]:
+
+        await ctx.send(
+            "A timer with that name already exists."
+        )
+
+        return
+
+    timer = {
+        "name": name,
+        "guild_id": ctx.guild.id,
+        "channel_id": ctx.channel.id,
+        "created_by": ctx.author.id,
+        "started_at": now_utc(),
+        "end_at": now_utc() + timedelta(
+            seconds=seconds
+        ),
+        "remaining": seconds,
+        "paused": False
+    }
+
+    timers[
+        ctx.guild.id
+    ][
+        name
+    ] = timer
+
+    task = asyncio.create_task(
+        timer_runner(
+            ctx.guild.id,
+            name
+        )
+    )
+
+    giveaway_tasks[
+        f"timer:{ctx.guild.id}:{name}"
+    ] = task
+
+    await ctx.send(
+        f"Timer **{name}** started for "
+        f"**{format_duration(seconds)}**."
+    )
+
+
+@bot.command(name="tend")
+@is_admin()
+async def timer_end(
+    ctx,
+    *,
+    name
+):
+
+    timer = timers[
+        ctx.guild.id
+    ].pop(
+        name,
+        None
+    )
+
+    if not timer:
+
+        await ctx.send(
+            "That timer does not exist."
+        )
+
+        return
+
+    task_key = (
+        f"timer:{ctx.guild.id}:{name}"
+    )
+
+    task = giveaway_tasks.pop(
+        task_key,
+        None
+    )
+
+    if task:
+        task.cancel()
+
+    await ctx.send(
+        f"Timer **{name}** ended."
+    )
+
+
+@bot.command(name="tpause")
+@is_admin()
+async def timer_pause(
+    ctx,
+    *,
+    name
+):
+
+    timer = timers[
+        ctx.guild.id
+    ].get(
+        name
+    )
+
+    if not timer:
+
+        await ctx.send(
+            "That timer does not exist."
+        )
+
+        return
+
+    if timer["paused"]:
+
+        await ctx.send(
+            f"Timer **{name}** is already paused."
+        )
+
+        return
+
+    timer["remaining"] = max(
+        0,
+        (
+            timer["end_at"]
+            - now_utc()
+        ).total_seconds()
+    )
+
+    timer["paused"] = True
+
+    await ctx.send(
+        f"Timer **{name}** paused."
+    )
+
+
+# =========================================================
+# GIVEAWAYS
+# =========================================================
+
+class GiveawayView(discord.ui.View):
+
+    def __init__(
+        self,
+        giveaway_id
+    ):
+        super().__init__(
+            timeout=None
+        )
+
+        self.giveaway_id = giveaway_id
+
+        self.join_button = discord.ui.Button(
+            label="Join Giveaway",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"giveaway_join:{giveaway_id}"
+        )
+
+        self.join_button.callback = self.join_callback
+
+        self.add_item(
+            self.join_button
+        )
+
+    async def join_callback(
+        self,
+        interaction
+    ):
+
+        giveaway = giveaways.get(
+            self.giveaway_id
+        )
+
+        if not giveaway:
+
+            await interaction.response.send_message(
+                "This giveaway no longer exists.",
+                ephemeral=True
+            )
+
+            return
+
+        if giveaway["ended"]:
+
+            await interaction.response.send_message(
+                "This giveaway has already ended.",
+                ephemeral=True
+            )
+
+            return
+
+        if interaction.user.id in giveaway_blacklist[
+            interaction.guild.id
+        ]:
+
+            await interaction.response.send_message(
+                "You are blacklisted from giveaways.",
+                ephemeral=True
+            )
+
+            return
+
+        if interaction.user.id in giveaway["entries"]:
+
+            giveaway["entries"].remove(
+                interaction.user.id
+            )
+
+            await interaction.response.send_message(
+                "You have left the giveaway.",
+                ephemeral=True
+            )
+
+        else:
+
+            giveaway["entries"].add(
+                interaction.user.id
+            )
+
+            await interaction.response.send_message(
+                "You have joined the giveaway.",
+                ephemeral=True
+            )
+
+
+def giveaway_embed(
+    giveaway,
+    guild
+):
+
+    end_at = giveaway["end_at"]
+
+    embed = discord.Embed(
+        title=giveaway["reward"],
+        description=(
+            f"Winners: {giveaway['winners']}\n"
+            f"Ends: {format_discord_relative(end_at)} "
+            f"({format_discord_time(end_at)})\n"
+            f"Hosted by: {giveaway['host'].mention}\n\n"
+            f"Click On Button Below To Participate"
+        )
+    )
+
+    embed.set_footer(
+        text=f"Ends at • {end_at.strftime('%A, %B %d, %Y at %I:%M %p')}"
+    )
+
+    return embed
+
+
+async def update_giveaway_message(
+    giveaway
+):
+
+    channel = bot.get_channel(
+        giveaway["channel_id"]
+    )
+
+    if not channel:
+        return
+
+    try:
+
+        message = await channel.fetch_message(
+            giveaway["message_id"]
+        )
+
+        await message.edit(
+            embed=giveaway_embed(
+                giveaway,
+                channel.guild
+            ),
+            view=GiveawayView(
+                giveaway["id"]
+            )
+        )
+
+    except (
+        discord.NotFound,
+        discord.HTTPException
+    ):
+        pass
+
+
+async def finish_giveaway(
+    giveaway_id
+):
+
+    giveaway = giveaways.get(
+        giveaway_id
+    )
+
+    if not giveaway:
+        return
+
+    if giveaway["ended"]:
+        return
+
+    remaining = (
+        giveaway["end_at"]
+        - now_utc()
+    ).total_seconds()
+
+    if remaining > 0:
+
+        await asyncio.sleep(
+            remaining
+        )
+
+    giveaway = giveaways.get(
+        giveaway_id
+    )
+
+    if not giveaway:
+        return
+
+    if giveaway["ended"]:
+        return
+
+    giveaway["ended"] = True
+
+    entries = list(
+        giveaway["entries"]
+    )
+
+    winners_amount = min(
+        giveaway["winners"],
+        len(entries)
+    )
+
+    selected_winners = []
+
+    if winners_amount > 0:
+
+        selected_winners = random.sample(
+            entries,
+            winners_amount
+        )
+
+    channel = bot.get_channel(
+        giveaway["channel_id"]
+    )
+
+    if not channel:
+        return
+
+    winner_mentions = []
+
+    for user_id in selected_winners:
+
+        member = channel.guild.get_member(
+            user_id
+        )
+
+        if member:
+            winner_mentions.append(
+                member.mention
+            )
+
+    if winner_mentions:
+
+        winner_text = ", ".join(
+            winner_mentions
+        )
+
+        result = (
+            f"Giveaway ended.\n\n"
+            f"Reward: **{giveaway['reward']}**\n"
+            f"Winner{'s' if len(winner_mentions) != 1 else ''}: "
+            f"{winner_text}"
+        )
+
+    else:
+
+        result = (
+            f"Giveaway ended.\n\n"
+            f"Reward: **{giveaway['reward']}**\n"
+            f"There were no eligible participants."
+        )
+
+    try:
+
+        message = await channel.fetch_message(
+            giveaway["message_id"]
+        )
+
+        await message.edit(
+            content=result,
+            embed=None,
+            view=None
+        )
+
+    except (
+        discord.NotFound,
+        discord.HTTPException
+    ):
+
+        try:
+            await channel.send(
+                result
+            )
+        except discord.HTTPException:
+            pass
+
+    giveaway_tasks.pop(
+        f"giveaway:{giveaway_id}",
+        None
+    )
+
+
+@bot.command(name="gstart")
+@is_admin()
+async def giveaway_start(
+    ctx,
+    duration,
+    winners: int,
+    *,
+    reward
+):
+
+    seconds = parse_giveaway_duration(
+        duration
+    )
+
+    if seconds is None:
+
+        await ctx.send(
+            "Invalid duration. Example: `.gstart 1h 1 Nitro`"
+        )
+
+        return
+
+    if seconds <= 0:
+
+        await ctx.send(
+            "Giveaway duration must be greater than zero."
+        )
+
+        return
+
+    if winners < 1:
+
+        await ctx.send(
+            "Winner amount must be at least 1."
+        )
+
+        return
+
+    if not reward.strip():
+
+        await ctx.send(
+            "Giveaway reward cannot be empty."
+        )
+
+        return
+
+    end_at = now_utc() + timedelta(
+        seconds=seconds
+    )
+
+    giveaway_id = (
+        f"{ctx.guild.id}-"
+        f"{ctx.channel.id}-"
+        f"{int(now_utc().timestamp() * 1000)}"
+    )
+
+    giveaway = {
+        "id": giveaway_id,
+        "guild_id": ctx.guild.id,
+        "channel_id": ctx.channel.id,
+        "message_id": None,
+        "host": ctx.author,
+        "host_id": ctx.author.id,
+        "winners": winners,
+        "reward": reward,
+        "end_at": end_at,
+        "entries": set(),
+        "ended": False
+    }
+
+    giveaways[
+        giveaway_id
+    ] = giveaway
+
+    view = GiveawayView(
+        giveaway_id
+    )
+
+    message = await ctx.send(
+        embed=giveaway_embed(
+            giveaway,
+            ctx.guild
+        ),
+        view=view
+    )
+
+    giveaway["message_id"] = message.id
+
+    task = asyncio.create_task(
+        finish_giveaway(
+            giveaway_id
+        )
+    )
+
+    giveaway_tasks[
+        f"giveaway:{giveaway_id}"
+    ] = task
+
+
+@bot.command(name="gend")
+@is_admin()
+async def giveaway_end(
+    ctx,
+    message_id: int
+):
+
+    giveaway = None
+    giveaway_id = None
+
+    for gid, data in giveaways.items():
+
+        if data["message_id"] == message_id:
+            giveaway = data
+            giveaway_id = gid
+            break
+
+    if not giveaway:
+
+        await ctx.send(
+            "No active giveaway was found with that message ID."
+        )
+
+        return
+
+    if giveaway["guild_id"] != ctx.guild.id:
+
+        await ctx.send(
+            "That giveaway belongs to another server."
+        )
+
+        return
+
+    if giveaway["ended"]:
+
+        await ctx.send(
+            "That giveaway has already ended."
+        )
+
+        return
+
+    task = giveaway_tasks.get(
+        f"giveaway:{giveaway_id}"
+    )
+
+    if task:
+        task.cancel()
+
+    giveaway["end_at"] = now_utc()
+
+    await finish_giveaway(
+        giveaway_id
+    )
+
+
+@bot.command(name="gblacklist")
+@is_admin()
+async def giveaway_blacklist_command(
+    ctx,
+    member: discord.Member
+):
+
+    blacklist = giveaway_blacklist[
+        ctx.guild.id
+    ]
+
+    if member.id in blacklist:
+
+        blacklist.remove(
+            member.id
+        )
+
+        await ctx.send(
+            f"{member.mention} has been removed "
+            f"from the giveaway blacklist."
+        )
+
+    else:
+
+        blacklist.add(
+            member.id
+        )
+
+        await ctx.send(
+            f"{member.mention} has been added "
+            f"to the giveaway blacklist."
+        )
+
+
+# =========================================================
 # INVITE CACHE
 # =========================================================
 
-async def refresh_invites(guild):
+async def refresh_invites(
+    guild
+):
 
     try:
 
@@ -1426,28 +2578,10 @@ async def refresh_invites(guild):
         discord.Forbidden,
         discord.HTTPException
     ):
+
         invite_cache[
             guild.id
         ] = {}
-
-
-# =========================================================
-# READY
-# =========================================================
-
-@bot.event
-async def on_ready():
-
-    print(
-        f"Logged in as {bot.user} ({bot.user.id})"
-    )
-
-    print(
-        "Dream Land Security is online."
-    )
-
-    for guild in bot.guilds:
-        await refresh_invites(guild)
 
 
 # =========================================================
@@ -1455,7 +2589,9 @@ async def on_ready():
 # =========================================================
 
 @bot.event
-async def on_member_join(member):
+async def on_member_join(
+    member
+):
 
     guild = member.guild
 
@@ -1501,10 +2637,11 @@ async def on_member_join(member):
         discord.Forbidden,
         discord.HTTPException
     ):
+
         inviter_id = None
 
     # -----------------------------------------------------
-    # INVITE STATISTICS
+    # INVITES
     # -----------------------------------------------------
 
     if inviter_id and inviter_id != member.id:
@@ -1518,7 +2655,7 @@ async def on_member_join(member):
         data["joins"] += 1
 
         account_age = (
-            datetime.now(timezone.utc)
+            now_utc()
             - member.created_at
         ).days
 
@@ -1544,7 +2681,9 @@ async def on_member_join(member):
         guild.id
     )
 
-    greet_settings = settings["greet"]
+    greet_settings = settings[
+        "greet"
+    ]
 
     for channel_id in list(
         greet_settings["channels"]
@@ -1630,15 +2769,15 @@ async def on_member_join(member):
             )
 
             embed.set_footer(
-                text=(
-                    f"Member #{guild.member_count}"
-                )
+                text=f"Member #{guild.member_count}"
             )
 
             try:
+
                 await channel.send(
                     embed=embed
                 )
+
             except discord.HTTPException:
                 pass
 
@@ -1648,7 +2787,9 @@ async def on_member_join(member):
 # =========================================================
 
 @bot.event
-async def on_member_remove(member):
+async def on_member_remove(
+    member
+):
 
     guild = member.guild
 
@@ -1672,11 +2813,13 @@ async def on_member_remove(member):
 
 
 # =========================================================
-# COMMAND PROCESSING + LEVELS
+# LEVEL MESSAGE TRACKING
 # =========================================================
 
 @bot.event
-async def on_message(message):
+async def on_message(
+    message
+):
 
     if message.author.bot:
         return
@@ -1765,15 +2908,39 @@ async def on_message(message):
                     )
 
                     try:
+
                         await channel.send(
                             content
                         )
+
                     except discord.HTTPException:
                         pass
 
     await bot.process_commands(
         message
     )
+
+
+# =========================================================
+# READY
+# =========================================================
+
+@bot.event
+async def on_ready():
+
+    print(
+        f"Logged in as {bot.user} ({bot.user.id})"
+    )
+
+    print(
+        "Dream Land Security is online."
+    )
+
+    for guild in bot.guilds:
+
+        await refresh_invites(
+            guild
+        )
 
 
 # =========================================================
@@ -1796,45 +2963,55 @@ async def on_command_error(
         error,
         commands.CheckFailure
     ):
+
         await ctx.send(
             "You don't have permission to use this command."
         )
+
         return
 
     if isinstance(
         error,
         commands.MissingRequiredArgument
     ):
+
         await ctx.send(
             f"Missing argument: `{error.param.name}`"
         )
+
         return
 
     if isinstance(
         error,
         commands.MemberNotFound
     ):
+
         await ctx.send(
             "Member not found."
         )
+
         return
 
     if isinstance(
         error,
         commands.ChannelNotFound
     ):
+
         await ctx.send(
             "Channel not found."
         )
+
         return
 
     if isinstance(
         error,
         commands.BadArgument
     ):
+
         await ctx.send(
             "Invalid argument."
         )
+
         return
 
     print(
@@ -1847,8 +3024,11 @@ async def on_command_error(
 # =========================================================
 
 if not TOKEN:
+
     raise RuntimeError(
         "BOT_TOKEN is not set."
     )
 
-bot.run(TOKEN)
+bot.run(
+    TOKEN
+)
