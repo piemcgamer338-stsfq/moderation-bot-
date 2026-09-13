@@ -7,18 +7,17 @@ from datetime import timedelta
 
 import discord
 from discord.ext import commands
-from discord.ui import LayoutView, Container, TextDisplay, Separator, ActionRow, Select, Button
+from dotenv import load_dotenv
 
 
 # =========================================================
-# THUNDERNIGHT
+# SETUP
 # =========================================================
+
+load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
 PREFIX = "."
-
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set.")
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -40,40 +39,39 @@ bot = commands.Bot(
 
 guild_settings = defaultdict(lambda: {
     "greet": {
-        "channels": [],
         "message": "Welcome {user} to {server}!",
-        "delete_after": 0
+        "delay": 0,
+        "channels": []
     },
     "welcome": {
-        "channels": [],
-        "message": "Welcome {user} to {server}!"
+        "message": "Welcome {user} to {server}!",
+        "channel": None
     },
     "level": {
         "channel": None,
-        "message": "Congratulations {user}, you reached level {level}!"
+        "message": "{user} reached level {level}!",
+        "users": {}
     },
     "roles": {
+        "friend": None,
+        "mod": None,
+        "staff": None,
+        "jail": None,
         "vip": None
     }
 })
 
-level_data = defaultdict(lambda: {
-    "messages": 0,
-    "level": 0
-})
-
-invite_data = defaultdict(lambda: {
-    "joins": 0,
-    "left": 0,
-    "fake": 0,
-    "rejoins": 0,
-    "invites": 0
-})
+snipes = defaultdict(lambda: deque(maxlen=10))
 
 invite_cache = {}
-member_inviter = {}
+invite_data = defaultdict(lambda: defaultdict(lambda: {
+    "joins": 0,
+    "leaves": 0,
+    "fake": 0,
+    "rejoins": 0
+}))
 
-snipes = defaultdict(lambda: deque(maxlen=20))
+member_inviter = {}
 
 timers = {}
 timer_tasks = {}
@@ -84,7 +82,84 @@ giveaway_blacklist = defaultdict(set)
 
 
 # =========================================================
-# HELPERS
+# BOT PRESENCE
+# =========================================================
+
+@bot.event
+async def on_ready():
+    activity = discord.CustomActivity(
+        name="Best Event at .gg/thundernight"
+    )
+
+    await bot.change_presence(
+        status=discord.Status.online,
+        activity=activity
+    )
+
+    print(f"Logged in as {bot.user} ({bot.user.id})")
+
+
+# =========================================================
+# COMPONENTS V2 HELPERS
+# =========================================================
+
+def make_card(*items):
+    view = discord.ui.LayoutView()
+
+    container = discord.ui.Container()
+
+    for item in items:
+        if isinstance(item, str):
+            container.add_item(
+                discord.ui.TextDisplay(item)
+            )
+        else:
+            container.add_item(item)
+
+    view.add_item(container)
+    return view
+
+
+async def send_card(
+    target,
+    text,
+    *,
+    ephemeral=False,
+    allowed_mentions=None
+):
+    view = make_card(text)
+
+    if isinstance(target, discord.Interaction):
+        await target.response.send_message(
+            view=view,
+            ephemeral=ephemeral,
+            allowed_mentions=allowed_mentions
+        )
+    else:
+        await target.send(
+            view=view,
+            allowed_mentions=allowed_mentions
+        )
+
+
+async def edit_card(
+    interaction,
+    text,
+    *,
+    view=None,
+    allowed_mentions=None
+):
+    if view is None:
+        view = make_card(text)
+
+    await interaction.response.edit_message(
+        view=view,
+        allowed_mentions=allowed_mentions
+    )
+
+
+# =========================================================
+# PERMISSION
 # =========================================================
 
 def is_admin():
@@ -97,233 +172,32 @@ def is_admin():
     return commands.check(predicate)
 
 
-def format_duration(seconds):
-    seconds = max(0, int(seconds))
+# =========================================================
+# VARIABLE SYSTEM
+# =========================================================
 
-    days, seconds = divmod(seconds, 86400)
-    hours, seconds = divmod(seconds, 3600)
-    minutes, seconds = divmod(seconds, 60)
-
-    parts = []
-
-    if days:
-        parts.append(f"{days}d")
-
-    if hours:
-        parts.append(f"{hours}h")
-
-    if minutes:
-        parts.append(f"{minutes}m")
-
-    if seconds or not parts:
-        parts.append(f"{seconds}s")
-
-    return " ".join(parts)
-
-
-def format_end_time(dt):
-    return dt.strftime(
-        "%I:%M %p, %d %B %Y"
-    ).lstrip("0")
-
-
-def parse_duration(value):
-    value = value.lower().strip()
-
-    match = re.fullmatch(
-        r"(\d+(?:\.\d+)?)\s*(s|m|h|d|w)",
-        value
-    )
-
-    if not match:
-        raise ValueError(
-            "Invalid duration. Use `30s`, `10m`, `1h`, `1d` or `1w`."
-        )
-
-    amount = float(match.group(1))
-    unit = match.group(2)
-
-    multipliers = {
-        "s": 1,
-        "m": 60,
-        "h": 3600,
-        "d": 86400,
-        "w": 604800
-    }
-
-    return int(amount * multipliers[unit])
-
-
-def replace_variables(
-    message,
-    member=None,
-    guild=None,
-    level=None
-):
-    if guild is None and member:
-        guild = member.guild
-
-    if guild is None:
-        return message
+def replace_variables(text, member, guild):
+    if not text:
+        return ""
 
     values = {
+        "{user}": member.mention,
+        "{user.name}": member.name,
+        "{user.id}": str(member.id),
+        "{user.tag}": str(member),
         "{server}": guild.name,
-        "{serverid}": str(guild.id),
-        "{server_id}": str(guild.id),
+        "{server.id}": str(guild.id),
+        "{server.owner}": guild.owner.mention if guild.owner else "Unknown",
         "{membercount}": str(guild.member_count),
+        "{server.members}": str(guild.member_count),
+        "{channel}": getattr(member.guild.system_channel, "mention", "#channel")
+        if guild.system_channel else "#channel"
     }
 
-    if member:
-        values.update({
-            "{user}": member.mention,
-            "{username}": member.name,
-            "{userid}": str(member.id),
-            "{user_id}": str(member.id),
-            "{channel}": "",
-            "{channel_id}": "",
-            "{created}": (
-                f"<t:{int(member.created_at.timestamp())}:F>"
-            ),
-            "{joined}": (
-                f"<t:{int(member.joined_at.timestamp())}:F>"
-                if member.joined_at
-                else ""
-            )
-        })
-
-    if level is not None:
-        values["{level}"] = str(level)
-
     for key, value in values.items():
-        message = message.replace(
-            key,
-            value
-        )
+        text = text.replace(key, value)
 
-    return message
-
-
-# =========================================================
-# DISCORD COMPONENTS V2 CARD
-# =========================================================
-
-def make_card(
-    title,
-    description,
-    components=None
-):
-    view = LayoutView(
-        timeout=None
-    )
-
-    container = Container()
-
-    container.add_item(
-        TextDisplay(
-            f"## {title}"
-        )
-    )
-
-    if description:
-        container.add_item(
-            Separator()
-        )
-
-        container.add_item(
-            TextDisplay(
-                description
-            )
-        )
-
-    if components:
-        for component in components:
-            container.add_item(
-                component
-            )
-
-    view.add_item(
-        container
-    )
-
-    return view
-
-
-async def send_card(
-    destination,
-    title,
-    description,
-    components=None,
-    ephemeral=False
-):
-    view = make_card(
-        title,
-        description,
-        components
-    )
-
-    if isinstance(
-        destination,
-        discord.Interaction
-    ):
-        if destination.response.is_done():
-            return await destination.followup.send(
-                view=view,
-                ephemeral=ephemeral
-            )
-
-        return await destination.response.send_message(
-            view=view,
-            ephemeral=ephemeral
-        )
-
-    return await destination.send(
-        view=view
-    )
-
-
-async def edit_card(
-    interaction,
-    title,
-    description,
-    components=None
-):
-    view = make_card(
-        title,
-        description,
-        components
-    )
-
-    await interaction.response.edit_message(
-        view=view
-    )
-
-
-# =========================================================
-# EVENTS
-# =========================================================
-
-@bot.event
-async def on_ready():
-    print(
-        f"Logged in as {bot.user} ({bot.user.id})"
-    )
-    print(
-        "Thundernight is ready."
-    )
-
-
-@bot.event
-async def on_message_delete(message):
-    if message.author.bot:
-        return
-
-    snipes[
-        message.channel.id
-    ].appendleft({
-        "content": message.content,
-        "author": message.author,
-        "created_at": message.created_at
-    })
+    return text
 
 
 # =========================================================
@@ -334,7 +208,7 @@ HELP_CATEGORIES = {
     "Moderation": [
         ".ban @user",
         ".kick @user",
-        ".mute @user [duration]",
+        ".mute @user [1h/1d/1m]",
         ".lock",
         ".unlock",
         ".hide",
@@ -345,38 +219,33 @@ HELP_CATEGORIES = {
         ".purge [amount]",
         ".snipe"
     ],
-
     "Greet": [
         ".greet delafter [seconds]",
         ".greet message [message]",
         ".greet variables",
-        ".greet setchannel #channel",
-        ".greet removechannel #channel",
-        ".greet reset"
+        ".greet setchannel [channel]",
+        ".greet reset",
+        ".greet removechannel [channel]"
     ],
-
     "Welcome": [
-        ".welcome channel #channel",
+        ".welcome channel [channel]",
         ".welcome message [message]",
         ".welcome variables",
         ".welcome reset"
     ],
-
     "Level": [
         ".lvl [user]",
-        ".level channel #channel",
+        ".lvl message [message]",
+        ".lvl variables",
+        ".level channel [channel]",
         ".level lb",
-        ".level lbreset",
-        ".lvlmessage [message]",
-        ".lvlvariables"
+        ".level lbreset"
     ],
-
     "Invites": [
         ".i [user]",
         ".lb i",
         ".lbreset"
     ],
-
     "General": [
         ".avatar [user]",
         ".banner [user]",
@@ -388,148 +257,156 @@ HELP_CATEGORIES = {
         ".tend [name]",
         ".tpause [name]"
     ],
-
     "Giveaway": [
         ".gstart [time] [winners] [reward]",
         ".gend [message id]",
-        ".gblacklist @user"
+        ".gblacklist [user]"
     ],
-
     "Roles": [
-        ".vip [user]",
-        ".vip by replying to a message",
-        ".set vip [role]"
+        ".set friend [role]",
+        ".set mod [role]",
+        ".set staff [role]",
+        ".set jail [role]",
+        ".set vip [role]",
+        ".friend [user]",
+        ".mod [user]",
+        ".staff [user]",
+        ".jail [user]",
+        ".vip [user]"
     ]
 }
 
 
-def help_description(category=None):
-    if category is None:
-        total = sum(
-            len(commands_list)
-            for commands_list in HELP_CATEGORIES.values()
-        )
-
-        return (
-            "Hey, I'm Thundernight.\n\n"
-            "My prefix for this server is `.`\n"
-            "Type `.help [context]` for more.\n\n"
-            f"Total commands: `{total}`\n\n"
-            "Modules\n"
-            "Moderation\n"
-            "Greet\n"
-            "Welcome\n"
-            "Level\n"
-            "Invites\n"
-            "General\n"
-            "Giveaway\n"
-            "Roles\n\n"
-            "Select a module to see its commands."
-        )
-
-    return (
-        f"Module: **{category}**\n\n"
-        + "\n".join(
-            f"`{command}`"
-            for command in HELP_CATEGORIES[category]
-        )
-    )
-
-
-class HelpSelect(Select):
+class HelpView(discord.ui.LayoutView):
     def __init__(self):
-        super().__init__(
+        super().__init__(timeout=180)
+
+        self.container = discord.ui.Container()
+
+        self.container.add_item(
+            discord.ui.TextDisplay(
+                "## Thundernight\n\n"
+                "Hey, I'm Thundernight\n"
+                "My prefix for this server is `.`\n"
+                "Type `.help [context]` for more\n\n"
+                f"Total Commands: "
+                f"{sum(len(x) for x in HELP_CATEGORIES.values())}\n\n"
+                "**Modules**\n"
+                "Moderation\n"
+                "Greet\n"
+                "Welcome\n"
+                "Level\n"
+                "Invites\n"
+                "General\n"
+                "Giveaway\n"
+                "Roles\n\n"
+                "Select a module to see its commands."
+            )
+        )
+
+        self.container.add_item(
+            discord.ui.Separator()
+        )
+
+        select = discord.ui.Select(
             placeholder="Select a module",
             options=[
                 discord.SelectOption(
-                    label=category,
-                    value=category
+                    label=name,
+                    value=name
                 )
-                for category in HELP_CATEGORIES
-            ],
-            custom_id="thundernight_help_select"
-        )
-
-    async def callback(self, interaction):
-        await edit_card(
-            interaction,
-            "Thundernight",
-            help_description(
-                self.values[0]
-            ),
-            [
-                ActionRow(
-                    HelpSelect()
-                ),
-                ActionRow(
-                    HelpBack()
-                )
+                for name in HELP_CATEGORIES
             ]
         )
 
+        select.callback = self.category_selected
 
-class HelpBack(Button):
-    def __init__(self):
-        super().__init__(
+        row = discord.ui.ActionRow()
+        row.add_item(select)
+
+        self.container.add_item(row)
+        self.add_item(self.container)
+
+    async def category_selected(self, interaction):
+        category = interaction.data["values"][0]
+
+        commands_text = "\n".join(
+            f"`{command}`"
+            for command in HELP_CATEGORIES[category]
+        )
+
+        new_view = CategoryHelpView(
+            category,
+            commands_text
+        )
+
+        await interaction.response.edit_message(
+            view=new_view
+        )
+
+
+class CategoryHelpView(discord.ui.LayoutView):
+    def __init__(self, category, commands_text):
+        super().__init__(timeout=180)
+
+        container = discord.ui.Container()
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                f"## {category}\n\n"
+                f"{commands_text}"
+            )
+        )
+
+        container.add_item(
+            discord.ui.Separator()
+        )
+
+        back = discord.ui.Button(
             label="Back",
-            style=discord.ButtonStyle.secondary,
-            custom_id="thundernight_help_back"
+            style=discord.ButtonStyle.secondary
         )
 
-    async def callback(self, interaction):
-        await edit_card(
-            interaction,
-            "Thundernight",
-            help_description(),
-            [
-                ActionRow(
-                    HelpSelect()
-                )
-            ]
-        )
+        async def back_callback(interaction):
+            await interaction.response.edit_message(
+                view=HelpView()
+            )
+
+        back.callback = back_callback
+
+        row = discord.ui.ActionRow()
+        row.add_item(back)
+
+        container.add_item(row)
+
+        self.add_item(container)
 
 
-@bot.command(name="help")
-async def help_command(
-    ctx,
-    category=None
-):
-    selected = None
+@bot.command()
+async def help(ctx, *, context=None):
+    if context:
+        matched = None
 
-    if category:
-        for name in HELP_CATEGORIES:
-            if name.lower() == category.lower():
-                selected = name
+        for category in HELP_CATEGORIES:
+            if category.lower() == context.lower():
+                matched = category
                 break
 
-    if selected:
-        await send_card(
-            ctx,
-            "Thundernight",
-            help_description(
-                selected
-            ),
-            [
-                ActionRow(
-                    HelpSelect()
-                ),
-                ActionRow(
-                    HelpBack()
-                )
-            ]
-        )
+        if matched:
+            commands_text = "\n".join(
+                f"`{command}`"
+                for command in HELP_CATEGORIES[matched]
+            )
 
-    else:
-        await send_card(
-            ctx,
-            "Thundernight",
-            help_description(),
-            [
-                ActionRow(
-                    HelpSelect()
+            await ctx.send(
+                view=CategoryHelpView(
+                    matched,
+                    commands_text
                 )
-            ]
-        )
+            )
+            return
+
+    await ctx.send(view=HelpView())
 
 
 # =========================================================
@@ -538,101 +415,109 @@ async def help_command(
 
 @bot.command()
 @is_admin()
-async def ban(
-    ctx,
-    member: discord.Member,
-    *,
-    reason=None
-):
-    await member.ban(
-        reason=reason
-    )
+async def ban(ctx, member: discord.Member = None, *, reason=None):
+    if member is None:
+        return await send_card(ctx, "Usage: `.ban @user [reason]`")
+
+    await member.ban(reason=reason)
 
     await send_card(
         ctx,
-        "User Banned",
-        f"{member.mention} has been banned."
+        f"## Ban\n\n"
+        f"Given User: {member.mention}\n"
+        f"Reason: {reason or 'No reason provided'}"
     )
 
 
 @bot.command()
 @is_admin()
-async def kick(
-    ctx,
-    member: discord.Member,
-    *,
-    reason=None
-):
-    await member.kick(
-        reason=reason
-    )
+async def kick(ctx, member: discord.Member = None, *, reason=None):
+    if member is None:
+        return await send_card(ctx, "Usage: `.kick @user [reason]`")
+
+    await member.kick(reason=reason)
 
     await send_card(
         ctx,
-        "User Kicked",
-        f"{member.mention} has been kicked."
+        f"## Kick\n\n"
+        f"Given User: {member.mention}\n"
+        f"Reason: {reason or 'No reason provided'}"
     )
+
+
+def parse_duration(value):
+    match = re.fullmatch(
+        r"(\d+)(s|m|h|d)",
+        value.lower()
+    )
+
+    if not match:
+        return None
+
+    amount = int(match.group(1))
+    unit = match.group(2)
+
+    if unit == "s":
+        return timedelta(seconds=amount)
+
+    if unit == "m":
+        return timedelta(minutes=amount)
+
+    if unit == "h":
+        return timedelta(hours=amount)
+
+    if unit == "d":
+        return timedelta(days=amount)
+
+    return None
 
 
 @bot.command()
 @is_admin()
 async def mute(
     ctx,
-    member: discord.Member,
-    duration=None
+    member: discord.Member = None,
+    duration: str = None
 ):
-    if not duration:
-        await send_card(
+    if member is None or duration is None:
+        return await send_card(
             ctx,
-            "Mute",
-            "Usage: `.mute @user 1h`"
+            "Usage: `.mute @user [1h/1d/1m]`"
         )
-        return
 
-    try:
-        seconds = parse_duration(
-            duration
-        )
-    except ValueError as error:
-        await send_card(
-            ctx,
-            "Mute",
-            str(error)
-        )
-        return
+    delta = parse_duration(duration)
 
-    if seconds > 28 * 86400:
-        await send_card(
+    if delta is None:
+        return await send_card(
             ctx,
-            "Mute",
-            "Discord timeouts cannot exceed 28 days."
+            "Invalid duration."
         )
-        return
+
+    if delta > timedelta(days=28):
+        return await send_card(
+            ctx,
+            "Maximum timeout duration is 28 days."
+        )
+
+    until = discord.utils.utcnow() + delta
 
     await member.timeout(
-        timedelta(
-            seconds=seconds
-        ),
+        until,
         reason=f"Muted by {ctx.author}"
     )
 
     await send_card(
         ctx,
-        "User Muted",
-        (
-            f"{member.mention} has been muted for "
-            f"`{format_duration(seconds)}`."
-        )
+        f"## Mute\n\n"
+        f"Given User: {member.mention}\n"
+        f"Duration: `{duration}`"
     )
 
 
 @bot.command()
 @is_admin()
 async def lock(ctx):
-    overwrite = ctx.channel.overwrites_for(
-        ctx.guild.default_role
-    )
-
+    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
     overwrite.send_messages = False
 
     await ctx.channel.set_permissions(
@@ -640,20 +525,13 @@ async def lock(ctx):
         overwrite=overwrite
     )
 
-    await send_card(
-        ctx,
-        "Channel Locked",
-        f"{ctx.channel.mention} has been locked."
-    )
+    await send_card(ctx, "## Lock\n\nThis channel has been locked.")
 
 
 @bot.command()
 @is_admin()
 async def unlock(ctx):
-    overwrite = ctx.channel.overwrites_for(
-        ctx.guild.default_role
-    )
-
+    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
     overwrite.send_messages = None
 
     await ctx.channel.set_permissions(
@@ -661,20 +539,13 @@ async def unlock(ctx):
         overwrite=overwrite
     )
 
-    await send_card(
-        ctx,
-        "Channel Unlocked",
-        f"{ctx.channel.mention} has been unlocked."
-    )
+    await send_card(ctx, "## Unlock\n\nThis channel has been unlocked.")
 
 
 @bot.command()
 @is_admin()
 async def hide(ctx):
-    overwrite = ctx.channel.overwrites_for(
-        ctx.guild.default_role
-    )
-
+    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
     overwrite.view_channel = False
 
     await ctx.channel.set_permissions(
@@ -682,20 +553,13 @@ async def hide(ctx):
         overwrite=overwrite
     )
 
-    await send_card(
-        ctx,
-        "Channel Hidden",
-        f"{ctx.channel.mention} has been hidden."
-    )
+    await send_card(ctx, "## Hide\n\nThis channel has been hidden.")
 
 
 @bot.command()
 @is_admin()
 async def unhide(ctx):
-    overwrite = ctx.channel.overwrites_for(
-        ctx.guild.default_role
-    )
-
+    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
     overwrite.view_channel = None
 
     await ctx.channel.set_permissions(
@@ -703,352 +567,178 @@ async def unhide(ctx):
         overwrite=overwrite
     )
 
-    await send_card(
-        ctx,
-        "Channel Visible",
-        f"{ctx.channel.mention} is visible again."
-    )
+    await send_card(ctx, "## Unhide\n\nThis channel is visible again.")
 
 
 @bot.command()
 @is_admin()
-async def unban(
-    ctx,
-    user_id: int
-):
-    try:
-        user = await bot.fetch_user(
-            user_id
+async def unban(ctx, user_id: int = None):
+    if user_id is None:
+        return await send_card(
+            ctx,
+            "Usage: `.unban [userid]`"
         )
 
-        await ctx.guild.unban(
-            user
-        )
+    try:
+        user = await bot.fetch_user(user_id)
+        await ctx.guild.unban(user)
 
         await send_card(
             ctx,
-            "User Unbanned",
-            f"{user.mention} has been unbanned."
+            f"## Unban\n\nUnbanned User: {user.mention}"
         )
 
     except discord.NotFound:
-        await send_card(
-            ctx,
-            "Unban Failed",
-            "That user is not currently banned."
-        )
+        await send_card(ctx, "User is not banned or could not be found.")
 
 
 @bot.command()
 @is_admin()
-async def purge(
-    ctx,
-    amount: int
-):
-    if amount <= 0:
-        await send_card(
+async def purge(ctx, amount: int = None):
+    if amount is None or amount < 1:
+        return await send_card(
             ctx,
-            "Purge",
-            "Amount must be greater than zero."
+            "Usage: `.purge [message count]`"
         )
-        return
 
     deleted = await ctx.channel.purge(
-        limit=amount
+        limit=amount + 1
     )
 
-    await send_card(
-        ctx,
-        "Messages Purged",
-        f"Deleted `{len(deleted)}` messages."
+    message = await ctx.send(
+        view=make_card(
+            f"## Purge\n\n"
+            f"Deleted `{len(deleted) - 1}` messages."
+        )
     )
+
+    await asyncio.sleep(3)
+
+    try:
+        await message.delete()
+    except discord.NotFound:
+        pass
 
 
 @bot.command()
 @is_admin()
 async def nuke(ctx):
-    old_channel = ctx.channel
+    channel = ctx.channel
 
-    new_channel = await old_channel.clone(
+    new_channel = await channel.clone(
         reason=f"Nuked by {ctx.author}"
     )
 
-    await new_channel.edit(
-        position=old_channel.position
-    )
-
-    await old_channel.delete(
-        reason=f"Nuked by {ctx.author}"
-    )
+    await channel.delete()
 
     await send_card(
         new_channel,
-        "Channel Nuked",
-        f"Channel recreated by {ctx.author.mention}."
+        "## Nuke\n\nThis channel has been nuked."
     )
 
 
 @bot.command()
 @is_admin()
 async def clone(ctx):
-    old_channel = ctx.channel
+    channel = ctx.channel
 
-    new_channel = await old_channel.clone(
+    new_channel = await channel.clone(
         reason=f"Cloned by {ctx.author}"
     )
 
-    await new_channel.edit(
-        position=old_channel.position
-    )
-
-    await old_channel.delete(
-        reason=f"Cloned by {ctx.author}"
-    )
+    await channel.delete()
 
     await send_card(
         new_channel,
-        "Channel Cloned",
-        f"Channel recreated by {ctx.author.mention}."
+        "## Clone\n\nThis channel has been cloned."
     )
 
 
 @bot.command()
 async def snipe(ctx):
-    messages = snipes.get(
-        ctx.channel.id
-    )
+    messages = snipes.get(ctx.channel.id)
 
     if not messages:
-        await send_card(
+        return await send_card(
             ctx,
-            "Snipe",
             "There are no deleted messages to show."
         )
-        return
 
-    data = messages[0]
+    message = messages[-1]
 
     await send_card(
         ctx,
-        "Deleted Message",
-        (
-            f"Author: {data['author'].mention}\n\n"
-            f"{data['content'] or '[No text content]'}"
-        )
+        f"## Snipe\n\n"
+        f"Author: {message['author']}\n"
+        f"Message:\n{message['content'] or '[No text]'}"
     )
 
 
 # =========================================================
-# ROLES
+# SNIPE EVENT
 # =========================================================
 
-@bot.command()
-@is_admin()
-async def set(
-    ctx,
-    role_type=None,
-    role: discord.Role = None
-):
-    if role_type is None or role is None:
-        await send_card(
-            ctx,
-            "Role Setup",
-            (
-                "Usage:\n"
-                "`.set vip @Role`"
-            )
-        )
+@bot.event
+async def on_message_delete(message):
+    if message.author.bot:
         return
 
-    role_type = role_type.lower()
-
-    if role_type != "vip":
-        await send_card(
-            ctx,
-            "Role Setup",
-            "Currently supported role: `vip`"
-        )
-        return
-
-    guild_settings[
-        ctx.guild.id
-    ]["roles"]["vip"] = role.id
-
-    await send_card(
-        ctx,
-        "Role Setup",
-        (
-            f"VIP role has been set to "
-            f"{role.mention}."
-        )
-    )
-
-
-@bot.command()
-@is_admin()
-async def vip(
-    ctx,
-    member: discord.Member = None
-):
-    # -----------------------------------------------------
-    # If no member was mentioned, check for a replied-to
-    # message.
-    # -----------------------------------------------------
-
-    if member is None:
-        reference = ctx.message.reference
-
-        if reference and reference.message_id:
-            try:
-                replied_message = await ctx.channel.fetch_message(
-                    reference.message_id
-                )
-
-                member = replied_message.author
-
-            except discord.NotFound:
-                member = None
-
-    if member is None:
-        await send_card(
-            ctx,
-            "VIP",
-            (
-                "Usage:\n"
-                "`.vip @user`\n"
-                "or reply to the user's message with `.vip`."
-            )
-        )
-        return
-
-    role_id = guild_settings[
-        ctx.guild.id
-    ]["roles"]["vip"]
-
-    if role_id is None:
-        await send_card(
-            ctx,
-            "VIP",
-            (
-                "VIP role has not been configured.\n\n"
-                "Use `.set vip @Role` first."
-            )
-        )
-        return
-
-    role = ctx.guild.get_role(
-        role_id
-    )
-
-    if role is None:
-        await send_card(
-            ctx,
-            "VIP",
-            "The configured VIP role no longer exists."
-        )
-        return
-
-    if role >= ctx.guild.me.top_role:
-        await send_card(
-            ctx,
-            "VIP",
-            "I cannot give this role because it is above my highest role."
-        )
-        return
-
-    try:
-        await member.add_roles(
-            role,
-            reason=f"VIP given by {ctx.author}"
-        )
-
-    except discord.Forbidden:
-        await send_card(
-            ctx,
-            "VIP",
-            "I do not have permission to give this role."
-        )
-        return
-
-    # -----------------------------------------------------
-    # role.mention creates the normal Discord role mention.
-    # Inside this Components V2 response we escape the
-    # mention so Discord displays the actual role without
-    # notifying the role members.
-    # -----------------------------------------------------
-
-    safe_role_mention = role.mention.replace(
-        "<@&",
-        "<@&"
-    )
-
-    await send_card(
-        ctx,
-        "VIP",
-        (
-            f"Given User {member.mention}\n"
-            f"Role: {safe_role_mention}"
-        )
-    )
+    snipes[message.channel.id].append({
+        "author": str(message.author),
+        "content": message.content
+    })
 
 
 # =========================================================
 # GREET
 # =========================================================
 
-@bot.group(
-    name="greet",
-    invoke_without_command=True
-)
+@bot.group(name="greet", invoke_without_command=True)
 async def greet(ctx):
     await send_card(
         ctx,
-        "Greet",
-        (
-            "`.greet delafter [seconds]`\n"
-            "`.greet message [message]`\n"
-            "`.greet variables`\n"
-            "`.greet setchannel #channel`\n"
-            "`.greet removechannel #channel`\n"
-            "`.greet reset`"
-        )
+        "## Greet\n\n"
+        "Use `.greet [command]`.\n\n"
+        "Commands:\n"
+        "`.greet delafter [seconds]`\n"
+        "`.greet message [message]`\n"
+        "`.greet variables`\n"
+        "`.greet setchannel [channel]`\n"
+        "`.greet reset`\n"
+        "`.greet removechannel [channel]`"
     )
 
 
 @greet.command(name="delafter")
 @is_admin()
-async def greet_delafter(
-    ctx,
-    seconds: int
-):
-    guild_settings[
-        ctx.guild.id
-    ]["greet"]["delete_after"] = max(
-        0,
-        seconds
-    )
+async def greet_delafter(ctx, seconds: int = None):
+    if seconds is None or seconds < 0:
+        return await send_card(
+            ctx,
+            "Usage: `.greet delafter [seconds]`"
+        )
+
+    guild_settings[ctx.guild.id]["greet"]["delay"] = seconds
 
     await send_card(
         ctx,
-        "Greet",
-        f"Greet messages will be deleted after `{seconds}` seconds."
+        f"Greet delete delay set to `{seconds}` seconds."
     )
 
 
 @greet.command(name="message")
 @is_admin()
-async def greet_message(
-    ctx,
-    *,
-    message
-):
-    guild_settings[
-        ctx.guild.id
-    ]["greet"]["message"] = message
+async def greet_message(ctx, *, message=None):
+    if not message:
+        return await send_card(
+            ctx,
+            "Usage: `.greet message [message]`"
+        )
+
+    guild_settings[ctx.guild.id]["greet"]["message"] = message
 
     await send_card(
         ctx,
-        "Greet",
         "Greet message updated."
     )
 
@@ -1057,19 +747,17 @@ async def greet_message(
 async def greet_variables(ctx):
     await send_card(
         ctx,
-        "Greet Variables",
-        (
-            "`{user}`\n"
-            "`{username}`\n"
-            "`{userid}`\n"
-            "`{user_id}`\n"
-            "`{server}`\n"
-            "`{serverid}`\n"
-            "`{server_id}`\n"
-            "`{membercount}`\n"
-            "`{created}`\n"
-            "`{joined}`"
-        )
+        "## Greet Variables\n\n"
+        "`{user}`\n"
+        "`{user.name}`\n"
+        "`{user.id}`\n"
+        "`{user.tag}`\n"
+        "`{server}`\n"
+        "`{server.id}`\n"
+        "`{server.owner}`\n"
+        "`{membercount}`\n"
+        "`{server.members}`\n"
+        "`{channel}`"
     )
 
 
@@ -1077,29 +765,28 @@ async def greet_variables(ctx):
 @is_admin()
 async def greet_setchannel(
     ctx,
-    channel: discord.TextChannel
+    channel: discord.TextChannel = None
 ):
-    channels = guild_settings[
-        ctx.guild.id
-    ]["greet"]["channels"]
+    if channel is None:
+        return await send_card(
+            ctx,
+            "Usage: `.greet setchannel #channel`"
+        )
+
+    channels = guild_settings[ctx.guild.id]["greet"]["channels"]
 
     if channel.id not in channels:
         if len(channels) >= 5:
-            await send_card(
+            return await send_card(
                 ctx,
-                "Greet",
-                "Maximum of 5 greet channels allowed."
+                "You can configure a maximum of 5 greet channels."
             )
-            return
 
-        channels.append(
-            channel.id
-        )
+        channels.append(channel.id)
 
     await send_card(
         ctx,
-        "Greet",
-        f"{channel.mention} has been added."
+        f"Greet channel added: {channel.mention}"
     )
 
 
@@ -1107,60 +794,50 @@ async def greet_setchannel(
 @is_admin()
 async def greet_removechannel(
     ctx,
-    channel: discord.TextChannel
+    channel: discord.TextChannel = None
 ):
-    channels = guild_settings[
-        ctx.guild.id
-    ]["greet"]["channels"]
+    if channel is None:
+        return await send_card(
+            ctx,
+            "Usage: `.greet removechannel #channel`"
+        )
+
+    channels = guild_settings[ctx.guild.id]["greet"]["channels"]
 
     if channel.id in channels:
-        channels.remove(
-            channel.id
-        )
+        channels.remove(channel.id)
 
     await send_card(
         ctx,
-        "Greet",
-        f"{channel.mention} has been removed."
+        f"Greet channel removed: {channel.mention}"
     )
 
 
 @greet.command(name="reset")
 @is_admin()
 async def greet_reset(ctx):
-    guild_settings[
-        ctx.guild.id
-    ]["greet"] = {
-        "channels": [],
+    guild_settings[ctx.guild.id]["greet"] = {
         "message": "Welcome {user} to {server}!",
-        "delete_after": 0
+        "delay": 0,
+        "channels": []
     }
 
-    await send_card(
-        ctx,
-        "Greet",
-        "Greet settings have been reset."
-    )
+    await send_card(ctx, "Greet settings have been reset.")
 
 
 # =========================================================
 # WELCOME
 # =========================================================
 
-@bot.group(
-    name="welcome",
-    invoke_without_command=True
-)
+@bot.group(name="welcome", invoke_without_command=True)
 async def welcome(ctx):
     await send_card(
         ctx,
-        "Welcome",
-        (
-            "`.welcome channel #channel`\n"
-            "`.welcome message [message]`\n"
-            "`.welcome variables`\n"
-            "`.welcome reset`"
-        )
+        "## Welcome\n\n"
+        "`.welcome channel [channel]`\n"
+        "`.welcome message [message]`\n"
+        "`.welcome variables`\n"
+        "`.welcome reset`"
     )
 
 
@@ -1168,46 +845,35 @@ async def welcome(ctx):
 @is_admin()
 async def welcome_channel(
     ctx,
-    channel: discord.TextChannel
+    channel: discord.TextChannel = None
 ):
-    channels = guild_settings[
-        ctx.guild.id
-    ]["welcome"]["channels"]
-
-    if channel.id not in channels:
-        if len(channels) >= 5:
-            await send_card(
-                ctx,
-                "Welcome",
-                "Maximum of 5 welcome channels allowed."
-            )
-            return
-
-        channels.append(
-            channel.id
+    if channel is None:
+        return await send_card(
+            ctx,
+            "Usage: `.welcome channel #channel`"
         )
+
+    guild_settings[ctx.guild.id]["welcome"]["channel"] = channel.id
 
     await send_card(
         ctx,
-        "Welcome",
-        f"{channel.mention} has been added."
+        f"Welcome channel set to {channel.mention}."
     )
 
 
 @welcome.command(name="message")
 @is_admin()
-async def welcome_message(
-    ctx,
-    *,
-    message
-):
-    guild_settings[
-        ctx.guild.id
-    ]["welcome"]["message"] = message
+async def welcome_message(ctx, *, message=None):
+    if not message:
+        return await send_card(
+            ctx,
+            "Usage: `.welcome message [message]`"
+        )
+
+    guild_settings[ctx.guild.id]["welcome"]["message"] = message
 
     await send_card(
         ctx,
-        "Welcome",
         "Welcome message updated."
     )
 
@@ -1216,35 +882,30 @@ async def welcome_message(
 async def welcome_variables(ctx):
     await send_card(
         ctx,
-        "Welcome Variables",
-        (
-            "`{user}`\n"
-            "`{username}`\n"
-            "`{userid}`\n"
-            "`{user_id}`\n"
-            "`{server}`\n"
-            "`{serverid}`\n"
-            "`{server_id}`\n"
-            "`{membercount}`\n"
-            "`{created}`\n"
-            "`{joined}`"
-        )
+        "## Welcome Variables\n\n"
+        "`{user}`\n"
+        "`{user.name}`\n"
+        "`{user.id}`\n"
+        "`{user.tag}`\n"
+        "`{server}`\n"
+        "`{server.id}`\n"
+        "`{server.owner}`\n"
+        "`{membercount}`\n"
+        "`{server.members}`\n"
+        "`{channel}`"
     )
 
 
 @welcome.command(name="reset")
 @is_admin()
 async def welcome_reset(ctx):
-    guild_settings[
-        ctx.guild.id
-    ]["welcome"] = {
-        "channels": [],
-        "message": "Welcome {user} to {server}!"
+    guild_settings[ctx.guild.id]["welcome"] = {
+        "message": "Welcome {user} to {server}!",
+        "channel": None
     }
 
     await send_card(
         ctx,
-        "Welcome",
         "Welcome settings have been reset."
     )
 
@@ -1253,41 +914,81 @@ async def welcome_reset(ctx):
 # LEVEL
 # =========================================================
 
-@bot.command(name="lvl")
-async def lvl(
-    ctx,
-    member: discord.Member = None
-):
-    member = member or ctx.author
+@bot.command()
+async def lvl(ctx, *args):
+    if args and args[0].lower() == "message":
+        if not ctx.author.guild_permissions.administrator:
+            return await send_card(
+                ctx,
+                "Administrator permission required."
+            )
 
-    data = level_data[
-        (ctx.guild.id, member.id)
-    ]
+        message = " ".join(args[1:])
+
+        if not message:
+            return await send_card(
+                ctx,
+                "Usage: `.lvl message [message]`"
+            )
+
+        guild_settings[ctx.guild.id]["level"]["message"] = message
+
+        return await send_card(
+            ctx,
+            "Level-up message updated."
+        )
+
+    if args and args[0].lower() == "variables":
+        return await send_card(
+            ctx,
+            "## Level Variables\n\n"
+            "`{user}`\n"
+            "`{user.name}`\n"
+            "`{user.id}`\n"
+            "`{user.tag}`\n"
+            "`{level}`\n"
+            "`{messages}`\n"
+            "`{server}`\n"
+            "`{membercount}`"
+        )
+
+    member = ctx.author
+
+    if args:
+        try:
+            member = await commands.MemberConverter().convert(
+                ctx,
+                args[0]
+            )
+        except commands.BadArgument:
+            return await send_card(
+                ctx,
+                "User not found."
+            )
+
+    data = guild_settings[ctx.guild.id]["level"]["users"]
+    user_data = data.get(
+        member.id,
+        {"messages": 0, "level": 0}
+    )
 
     await send_card(
         ctx,
-        "Level",
-        (
-            f"User: {member.mention}\n"
-            f"Level: `{data['level']}`\n"
-            f"Messages: `{data['messages']}`"
-        )
+        f"## Level\n\n"
+        f"User: {member.mention}\n"
+        f"Level: `{user_data['level']}`\n"
+        f"Messages: `{user_data['messages']}`"
     )
 
 
-@bot.group(
-    name="level",
-    invoke_without_command=True
-)
+@bot.group(name="level", invoke_without_command=True)
 async def level(ctx):
     await send_card(
         ctx,
-        "Level",
-        (
-            "`.level channel #channel`\n"
-            "`.level lb`\n"
-            "`.level lbreset`"
-        )
+        "## Level\n\n"
+        "`.level channel #channel`\n"
+        "`.level lb`\n"
+        "`.level lbreset`"
     )
 
 
@@ -1295,58 +996,258 @@ async def level(ctx):
 @is_admin()
 async def level_channel(
     ctx,
-    channel: discord.TextChannel
+    channel: discord.TextChannel = None
 ):
-    guild_settings[
-        ctx.guild.id
-    ]["level"]["channel"] = channel.id
+    if channel is None:
+        return await send_card(
+            ctx,
+            "Usage: `.level channel #channel`"
+        )
+
+    guild_settings[ctx.guild.id]["level"]["channel"] = channel.id
 
     await send_card(
         ctx,
-        "Level",
-        f"Level-up messages will be sent in {channel.mention}."
+        f"Level channel set to {channel.mention}."
     )
 
 
 @level.command(name="lb")
 async def level_lb(ctx):
-    users = []
+    users = guild_settings[ctx.guild.id]["level"]["users"]
 
-    for (
-        guild_id,
-        user_id
-    ), data in level_data.items():
-
-        if guild_id == ctx.guild.id:
-            users.append(
-                (
-                    user_id,
-                    data["level"],
-                    data["messages"]
-                )
-            )
-
-    users.sort(
-        key=lambda item: (
-            item[1],
-            item[2]
+    sorted_users = sorted(
+        users.items(),
+        key=lambda x: (
+            x[1]["level"],
+            x[1]["messages"]
         ),
         reverse=True
-    )
+    )[:3]
+
+    if not sorted_users:
+        return await send_card(
+            ctx,
+            "No level data yet."
+        )
 
     lines = []
 
-    for index, (
-        user_id,
-        level_value,
-        messages
-    ) in enumerate(
-        users[:3],
+    for index, (user_id, data) in enumerate(
+        sorted_users,
         start=1
     ):
-        member = ctx.guild.get_member(
-            user_id
+        member = ctx.guild.get_member(user_id)
+        name = member.mention if member else str(user_id)
+
+        lines.append(
+            f"**{index}.** {name} — "
+            f"Level `{data['level']}` "
+            f"Messages `{data['messages']}`"
         )
+
+    await send_card(
+        ctx,
+        "## Level Leaderboard\n\n" +
+        "\n".join(lines)
+    )
+
+
+@level.command(name="lbreset")
+@is_admin()
+async def level_lbreset(ctx):
+    guild_settings[ctx.guild.id]["level"]["users"].clear()
+
+    await send_card(
+        ctx,
+        "Level leaderboard has been reset."
+    )
+
+
+# =========================================================
+# INVITES
+# =========================================================
+
+async def cache_invites(guild):
+    try:
+        invites = await guild.invites()
+
+        invite_cache[guild.id] = {
+            invite.code: invite.uses
+            for invite in invites
+        }
+
+    except discord.Forbidden:
+        invite_cache[guild.id] = {}
+
+
+@bot.event
+async def on_guild_join(guild):
+    await cache_invites(guild)
+
+
+@bot.event
+async def on_member_join(member):
+    guild = member.guild
+
+    before = invite_cache.get(guild.id, {})
+
+    await asyncio.sleep(1)
+
+    try:
+        invites = await guild.invites()
+
+        used_invite = None
+
+        for invite in invites:
+            old_uses = before.get(invite.code, 0)
+
+            if invite.uses > old_uses:
+                used_invite = invite
+                break
+
+        invite_cache[guild.id] = {
+            invite.code: invite.uses
+            for invite in invites
+        }
+
+        if used_invite and used_invite.inviter:
+            inviter_id = used_invite.inviter.id
+
+            member_inviter[member.id] = inviter_id
+
+            data = invite_data[guild.id][inviter_id]
+            data["joins"] += 1
+
+            account_age = (
+                discord.utils.utcnow() - member.created_at
+            ).days
+
+            if account_age < 15:
+                data["fake"] += 1
+
+    except discord.Forbidden:
+        pass
+
+    # Greet
+    settings = guild_settings[guild.id]["greet"]
+
+    for channel_id in settings["channels"]:
+        channel = guild.get_channel(channel_id)
+
+        if not channel:
+            continue
+
+        text = replace_variables(
+            settings["message"],
+            member,
+            guild
+        )
+
+        try:
+            message = await channel.send(
+                view=make_card(text)
+            )
+
+            if settings["delay"] > 0:
+                await asyncio.sleep(settings["delay"])
+
+                try:
+                    await message.delete()
+                except discord.NotFound:
+                    pass
+
+        except discord.HTTPException:
+            pass
+
+    # Welcome
+    welcome_settings = guild_settings[guild.id]["welcome"]
+    welcome_channel_id = welcome_settings["channel"]
+
+    if welcome_channel_id:
+        channel = guild.get_channel(
+            welcome_channel_id
+        )
+
+        if channel:
+            text = replace_variables(
+                welcome_settings["message"],
+                member,
+                guild
+            )
+
+            try:
+                await channel.send(
+                    view=make_card(
+                        f"## Welcome\n\n{text}"
+                    )
+                )
+            except discord.HTTPException:
+                pass
+
+
+@bot.event
+async def on_member_remove(member):
+    inviter_id = member_inviter.get(member.id)
+
+    if inviter_id:
+        data = invite_data[member.guild.id][inviter_id]
+        data["leaves"] += 1
+
+
+@bot.command(name="i")
+async def invite_info(ctx, member: discord.Member = None):
+    member = member or ctx.author
+
+    data = invite_data[ctx.guild.id][member.id]
+
+    await send_card(
+        ctx,
+        f"## Invite log\n\n"
+        f"{member.mention}\n\n"
+        f"Joins: `{data['joins']}`\n"
+        f"Left: `{data['leaves']}`\n"
+        f"Fake: `{data['fake']}`\n"
+        f"Rejoins: `{data['rejoins']}`\n\n"
+        f"Requested by {ctx.author.mention}"
+    )
+
+
+@bot.command(name="lb")
+async def leaderboard(ctx, category=None):
+    if category is None:
+        return await send_card(
+            ctx,
+            "Usage: `.lb i`"
+        )
+
+    if category.lower() != "i":
+        return await send_card(
+            ctx,
+            "Available leaderboard: `.lb i`"
+        )
+
+    users = invite_data[ctx.guild.id]
+
+    sorted_users = sorted(
+        users.items(),
+        key=lambda x: x[1]["joins"],
+        reverse=True
+    )[:10]
+
+    if not sorted_users:
+        return await send_card(
+            ctx,
+            "No invite data yet."
+        )
+
+    lines = []
+
+    for index, (user_id, data) in enumerate(
+        sorted_users,
+        start=1
+    ):
+        member = ctx.guild.get_member(user_id)
 
         name = (
             member.mention
@@ -1355,69 +1256,107 @@ async def level_lb(ctx):
         )
 
         lines.append(
-            f"{index}. {name} — Level `{level_value}` — `{messages}` messages"
-        )
-
-    if not lines:
-        lines.append(
-            "No level data yet."
+            f"**{index}.** {name} — "
+            f"`{data['joins']}` invites"
         )
 
     await send_card(
         ctx,
-        "Level Leaderboard",
+        "## Invite Leaderboard\n\n" +
         "\n".join(lines)
     )
 
 
-@level.command(name="lbreset")
+@bot.command(name="lbreset")
 @is_admin()
-async def level_lbreset(ctx):
-    for key in list(
-        level_data.keys()
-    ):
-        if key[0] == ctx.guild.id:
-            del level_data[key]
+async def lbreset(ctx):
+    invite_data[ctx.guild.id].clear()
 
     await send_card(
         ctx,
-        "Level Leaderboard",
-        "Level leaderboard has been reset."
+        "Invite leaderboard has been reset."
     )
 
 
-@bot.command(name="lvlmessage")
-@is_admin()
-async def lvlmessage(
-    ctx,
-    *,
-    message
-):
-    guild_settings[
-        ctx.guild.id
-    ]["level"]["message"] = message
+# =========================================================
+# LEVEL MESSAGE TRACKING
+# =========================================================
 
-    await send_card(
-        ctx,
-        "Level",
-        "Level-up message updated."
-    )
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
 
+    if message.guild:
+        data = guild_settings[
+            message.guild.id
+        ]["level"]["users"]
 
-@bot.command(name="lvlvariables")
-async def lvlvariables(ctx):
-    await send_card(
-        ctx,
-        "Level Variables",
-        (
-            "`{user}`\n"
-            "`{username}`\n"
-            "`{userid}`\n"
-            "`{server}`\n"
-            "`{serverid}`\n"
-            "`{level}`"
+        user_data = data.setdefault(
+            message.author.id,
+            {
+                "messages": 0,
+                "level": 0
+            }
         )
-    )
+
+        user_data["messages"] += 1
+
+        if (
+            user_data["messages"] % 100 == 0
+        ):
+            user_data["level"] += 1
+
+            channel_id = guild_settings[
+                message.guild.id
+            ]["level"]["channel"]
+
+            if channel_id:
+                channel = message.guild.get_channel(
+                    channel_id
+                )
+
+                if channel:
+                    text = guild_settings[
+                        message.guild.id
+                    ]["level"]["message"]
+
+                    text = text.replace(
+                        "{user}",
+                        message.author.mention
+                    )
+                    text = text.replace(
+                        "{user.name}",
+                        message.author.name
+                    )
+                    text = text.replace(
+                        "{user.id}",
+                        str(message.author.id)
+                    )
+                    text = text.replace(
+                        "{level}",
+                        str(user_data["level"])
+                    )
+                    text = text.replace(
+                        "{messages}",
+                        str(user_data["messages"])
+                    )
+                    text = text.replace(
+                        "{server}",
+                        message.guild.name
+                    )
+                    text = text.replace(
+                        "{membercount}",
+                        str(message.guild.member_count)
+                    )
+
+                    await channel.send(
+                        view=make_card(
+                            "## Level Up\n\n" + text
+                        )
+                    )
+
+    await bot.process_commands(message)
 
 
 # =========================================================
@@ -1425,99 +1364,82 @@ async def lvlvariables(ctx):
 # =========================================================
 
 @bot.command()
-async def avatar(
-    ctx,
-    member: discord.Member = None
-):
+async def avatar(ctx, member: discord.Member = None):
     member = member or ctx.author
+
+    avatar_url = member.display_avatar.url
 
     await send_card(
         ctx,
-        "Avatar",
-        (
-            f"User: {member.mention}\n"
-            f"{member.display_avatar.url}"
-        )
+        f"## Avatar\n\n"
+        f"User: {member.mention}\n"
+        f"{avatar_url}"
     )
 
 
 @bot.command()
-async def banner(
-    ctx,
-    member: discord.Member = None
-):
+async def banner(ctx, member: discord.Member = None):
     member = member or ctx.author
 
-    user = await bot.fetch_user(
-        member.id
-    )
+    user = await bot.fetch_user(member.id)
 
     if not user.banner:
-        await send_card(
+        return await send_card(
             ctx,
-            "Banner",
             "This user does not have a banner."
         )
-        return
 
     await send_card(
         ctx,
-        "Banner",
-        (
-            f"User: {member.mention}\n"
-            f"{user.banner.url}"
-        )
-    )
-
-
-@bot.command(name="srvlogo")
-async def srvlogo(ctx):
-    if not ctx.guild.icon:
-        await send_card(
-            ctx,
-            "Server Logo",
-            "This server does not have a logo."
-        )
-        return
-
-    await send_card(
-        ctx,
-        "Server Logo",
-        ctx.guild.icon.url
-    )
-
-
-@bot.command(name="srvbanner")
-async def srvbanner(ctx):
-    if not ctx.guild.banner:
-        await send_card(
-            ctx,
-            "Server Banner",
-            "This server does not have a banner."
-        )
-        return
-
-    await send_card(
-        ctx,
-        "Server Banner",
-        ctx.guild.banner.url
+        f"## Banner\n\n"
+        f"User: {member.mention}\n"
+        f"{user.banner.url}"
     )
 
 
 @bot.command()
-async def profile(ctx):
-    member = ctx.author
+async def srvlogo(ctx):
+    if not ctx.guild.icon:
+        return await send_card(
+            ctx,
+            "This server does not have a logo."
+        )
 
     await send_card(
         ctx,
-        "Profile",
-        (
-            f"Username: {member}\n"
-            f"ID: `{member.id}`\n"
-            f"Created: <t:{int(member.created_at.timestamp())}:F>\n"
-            f"Joined: "
-            f"{f'<t:{int(member.joined_at.timestamp())}:F>' if member.joined_at else 'Unknown'}"
+        f"## Server Logo\n\n"
+        f"{ctx.guild.icon.url}"
+    )
+
+
+@bot.command()
+async def srvbanner(ctx):
+    if not ctx.guild.banner:
+        return await send_card(
+            ctx,
+            "This server does not have a banner."
         )
+
+    await send_card(
+        ctx,
+        f"## Server Banner\n\n"
+        f"{ctx.guild.banner.url}"
+    )
+
+
+@bot.command()
+async def profile(ctx, member: discord.Member = None):
+    member = member or ctx.author
+
+    await send_card(
+        ctx,
+        f"## Profile\n\n"
+        f"User: {member.mention}\n"
+        f"Username: `{member}`\n"
+        f"ID: `{member.id}`\n"
+        f"Created: <t:{int(member.created_at.timestamp())}:F>\n"
+        f"Joined: "
+        f"<t:{int(member.joined_at.timestamp())}:F>"
     )
 
 
@@ -1527,15 +1449,14 @@ async def server_info(ctx):
 
     await send_card(
         ctx,
-        "Server Information",
-        (
-            f"Name: {guild.name}\n"
-            f"ID: `{guild.id}`\n"
-            f"Members: `{guild.member_count}`\n"
-            f"Channels: `{len(guild.channels)}`\n"
-            f"Roles: `{len(guild.roles)}`\n"
-            f"Created: <t:{int(guild.created_at.timestamp())}:F>"
-        )
+        f"## Server Information\n\n"
+        f"Name: `{guild.name}`\n"
+        f"ID: `{guild.id}`\n"
+        f"Owner: {guild.owner.mention if guild.owner else 'Unknown'}\n"
+        f"Members: `{guild.member_count}`\n"
+        f"Channels: `{len(guild.channels)}`\n"
+        f"Roles: `{len(guild.roles)}`\n"
+        f"Created: <t:{int(guild.created_at.timestamp())}:F>"
     )
 
 
@@ -1543,515 +1464,338 @@ async def server_info(ctx):
 # TIMER
 # =========================================================
 
-class TimerView(LayoutView):
-    def __init__(self, timer_id):
-        super().__init__(
-            timeout=None
-        )
+def parse_timer(value):
+    return parse_duration(value)
 
-        self.timer_id = timer_id
 
-        self.container = Container()
-        self.text = TextDisplay("")
+class TimerView(discord.ui.LayoutView):
+    def __init__(self, name, ends_at, paused=False):
+        super().__init__(timeout=None)
 
-        self.container.add_item(
-            self.text
-        )
+        self.name = name
+        self.ends_at = ends_at
+        self.paused = paused
 
-        self.add_item(
-            self.container
-        )
+        container = discord.ui.Container()
 
-        self.refresh()
+        if paused:
+            description = "Timer Paused"
+        else:
+            timestamp = int(ends_at.timestamp())
 
-    def refresh(self):
-        timer = timers.get(
-            self.timer_id
-        )
-
-        if not timer:
-            self.text.content = (
-                "## Timer\n\n"
-                "This timer no longer exists."
+            description = (
+                f"Timer End in <t:{timestamp}:R>\n"
+                f"End at <t:{timestamp}:F>"
             )
-            return
 
-        remaining = max(
-            0,
-            int(
-                (
-                    timer["ends_at"]
-                    - discord.utils.utcnow()
-                ).total_seconds()
+        container.add_item(
+            discord.ui.TextDisplay(
+                f"## {name}\n\n"
+                f"{description}"
             )
         )
 
-        end_time = format_end_time(
-            timer["ends_at"]
-        )
-
-        self.text.content = (
-            f"## {timer['name']}\n\n"
-            f"Timer End in `{format_duration(remaining)}`\n"
-            f"End at **{end_time}**"
-        )
-
-
-async def timer_loop(timer_id):
-    while timer_id in timers:
-        timer = timers[
-            timer_id
-        ]
-
-        if timer.get("paused"):
-            await asyncio.sleep(1)
-            continue
-
-        remaining = (
-            timer["ends_at"]
-            - discord.utils.utcnow()
-        ).total_seconds()
-
-        if remaining <= 0:
-            channel = bot.get_channel(
-                timer["channel_id"]
-            )
-
-            if channel:
-                await send_card(
-                    channel,
-                    timer["name"],
-                    "Timer Ended."
-                )
-
-            timers.pop(
-                timer_id,
-                None
-            )
-
-            timer_tasks.pop(
-                timer_id,
-                None
-            )
-
-            break
-
-        channel = bot.get_channel(
-            timer["channel_id"]
-        )
-
-        if channel:
-            try:
-                message = await channel.fetch_message(
-                    timer["message_id"]
-                )
-
-                await message.edit(
-                    view=TimerView(
-                        timer_id
-                    )
-                )
-
-            except discord.HTTPException:
-                pass
-
-        await asyncio.sleep(1)
+        self.add_item(container)
 
 
 @bot.command()
 @is_admin()
-async def tstart(
-    ctx,
-    duration=None,
-    *,
-    name=None
-):
+async def tstart(ctx, duration=None, *, name=None):
     if not duration or not name:
-        await send_card(
+        return await send_card(
             ctx,
-            "Timer",
-            "Usage: `.tstart 1h Timer Name`"
+            "Usage: `.tstart [1h] [name]`"
         )
-        return
 
-    try:
-        seconds = parse_duration(
-            duration
-        )
-    except ValueError as error:
-        await send_card(
+    delta = parse_timer(duration)
+
+    if delta is None:
+        return await send_card(
             ctx,
-            "Timer",
-            str(error)
+            "Invalid timer duration."
         )
-        return
 
-    ends_at = (
-        discord.utils.utcnow()
-        + timedelta(
-            seconds=seconds
-        )
-    )
+    ends_at = discord.utils.utcnow() + delta
 
-    timer_id = (
-        f"{ctx.guild.id}-"
-        f"{ctx.channel.id}-"
-        f"{ctx.message.id}"
-    )
-
-    timers[timer_id] = {
-        "guild_id": ctx.guild.id,
-        "channel_id": ctx.channel.id,
+    timers[(ctx.guild.id, name.lower())] = {
         "name": name,
         "ends_at": ends_at,
+        "channel_id": ctx.channel.id,
         "message_id": None,
         "paused": False,
-        "remaining": seconds
+        "remaining": delta
     }
 
-    message = await ctx.send(
-        view=TimerView(
-            timer_id
-        )
-    )
+    view = TimerView(name, ends_at)
 
-    timers[timer_id][
-        "message_id"
-    ] = message.id
+    message = await ctx.send(view=view)
 
-    timer_tasks[
-        timer_id
-    ] = asyncio.create_task(
-        timer_loop(
-            timer_id
-        )
-    )
-
-
-@bot.command()
-@is_admin()
-async def tend(
-    ctx,
-    *,
-    name
-):
-    timer_id = None
-
-    for key, timer in timers.items():
-        if (
-            timer["guild_id"] == ctx.guild.id
-            and timer["name"].lower() == name.lower()
-        ):
-            timer_id = key
-            break
-
-    if not timer_id:
-        await send_card(
-            ctx,
-            "Timer",
-            "Timer not found."
-        )
-        return
-
-    task = timer_tasks.pop(
-        timer_id,
-        None
-    )
-
-    if task:
-        task.cancel()
-
-    timer = timers.pop(
-        timer_id
-    )
+    timers[
+        (ctx.guild.id, name.lower())
+    ]["message_id"] = message.id
 
     await send_card(
         ctx,
-        timer["name"],
-        "Timer ended manually."
+        f"Timer `{name}` started."
     )
 
 
 @bot.command()
 @is_admin()
-async def tpause(
-    ctx,
-    *,
-    name
-):
-    timer_id = None
-
-    for key, timer in timers.items():
-        if (
-            timer["guild_id"] == ctx.guild.id
-            and timer["name"].lower() == name.lower()
-        ):
-            timer_id = key
-            break
-
-    if not timer_id:
-        await send_card(
+async def tend(ctx, *, name=None):
+    if not name:
+        return await send_card(
             ctx,
-            "Timer",
+            "Usage: `.tend [name]`"
+        )
+
+    key = (ctx.guild.id, name.lower())
+
+    timer = timers.pop(key, None)
+
+    if not timer:
+        return await send_card(
+            ctx,
             "Timer not found."
         )
-        return
 
-    timer = timers[
-        timer_id
-    ]
-
-    timer["remaining"] = max(
-        0,
-        int(
-            (
-                timer["ends_at"]
-                - discord.utils.utcnow()
-            ).total_seconds()
-        )
+    await send_card(
+        ctx,
+        f"Timer `{timer['name']}` ended."
     )
 
+
+@bot.command()
+@is_admin()
+async def tpause(ctx, *, name=None):
+    if not name:
+        return await send_card(
+            ctx,
+            "Usage: `.tpause [name]`"
+        )
+
+    key = (ctx.guild.id, name.lower())
+    timer = timers.get(key)
+
+    if not timer:
+        return await send_card(
+            ctx,
+            "Timer not found."
+        )
+
+    if timer["paused"]:
+        return await send_card(
+            ctx,
+            "Timer is already paused."
+        )
+
+    remaining = timer["ends_at"] - discord.utils.utcnow()
+
+    timer["remaining"] = remaining
     timer["paused"] = True
 
-    task = timer_tasks.pop(
-        timer_id,
-        None
+    channel = ctx.guild.get_channel(
+        timer["channel_id"]
     )
 
-    if task:
-        task.cancel()
+    if channel:
+        try:
+            message = await channel.fetch_message(
+                timer["message_id"]
+            )
+
+            await message.edit(
+                view=TimerView(
+                    timer["name"],
+                    timer["ends_at"],
+                    paused=True
+                )
+            )
+        except discord.HTTPException:
+            pass
 
     await send_card(
         ctx,
-        timer["name"],
-        (
-            "Timer paused.\n"
-            f"Remaining: `{format_duration(timer['remaining'])}`"
-        )
+        f"Timer `{timer['name']}` paused."
     )
 
 
 # =========================================================
-# GIVEAWAY
+# GIVEAWAYS
 # =========================================================
 
-class GiveawayJoinButton(Button):
+class GiveawayView(discord.ui.LayoutView):
     def __init__(self, giveaway_id):
-        super().__init__(
-            label="Join Giveaway",
-            style=discord.ButtonStyle.secondary,
-            custom_id=(
-                f"thundernight_giveaway:"
-                f"{giveaway_id}"
-            )
-        )
+        super().__init__(timeout=None)
 
         self.giveaway_id = giveaway_id
 
-    async def callback(
-        self,
-        interaction
-    ):
-        giveaway = giveaways.get(
-            self.giveaway_id
+        data = giveaways[giveaway_id]
+
+        timestamp = int(data["ends_at"].timestamp())
+
+        container = discord.ui.Container()
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                f"## {data['reward']}\n\n"
+                f"Winners: `{data['winners']}`\n"
+                f"Ends: <t:{timestamp}:R> "
+                f"(<t:{timestamp}:F>)\n"
+                f"Hosted by: {data['host'].mention}\n\n"
+                f"Click the button below to participate."
+            )
         )
 
-        if not giveaway:
-            await send_card(
-                interaction,
-                "Giveaway",
-                "This giveaway has ended.",
+        container.add_item(
+            discord.ui.Separator()
+        )
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                f"**Ends at • <t:{timestamp}:F>**"
+            )
+        )
+
+        button = discord.ui.Button(
+            label="Participate",
+            style=discord.ButtonStyle.secondary
+        )
+
+        button.callback = self.join
+
+        row = discord.ui.ActionRow()
+        row.add_item(button)
+
+        container.add_item(row)
+
+        self.add_item(container)
+
+    async def join(self, interaction):
+        data = giveaways.get(self.giveaway_id)
+
+        if not data:
+            return await interaction.response.send_message(
+                view=make_card(
+                    "This giveaway no longer exists."
+                ),
                 ephemeral=True
             )
-            return
 
-        if (
-            discord.utils.utcnow()
-            >= giveaway["ends_at"]
-        ):
-            await send_card(
-                interaction,
-                "Giveaway",
-                "This giveaway has ended.",
-                ephemeral=True
-            )
-            return
-
-        blacklist = giveaway_blacklist[
+        if interaction.user.id in giveaway_blacklist[
             interaction.guild.id
-        ]
-
-        if interaction.user.id in blacklist:
-            await send_card(
-                interaction,
-                "Giveaway",
-                "You are blacklisted from giveaways.",
+        ]:
+            return await interaction.response.send_message(
+                view=make_card(
+                    "You are blacklisted from giveaways."
+                ),
                 ephemeral=True
             )
-            return
 
-        if interaction.user.id in giveaway["entries"]:
-            giveaway["entries"].remove(
-                interaction.user.id
-            )
-
-            await send_card(
-                interaction,
-                "Giveaway",
-                "You have left the giveaway.",
+        if interaction.user.id in data["entries"]:
+            return await interaction.response.send_message(
+                view=make_card(
+                    "You are already participating."
+                ),
                 ephemeral=True
             )
-            return
 
-        giveaway["entries"].add(
-            interaction.user.id
-        )
+        data["entries"].add(interaction.user.id)
 
-        await send_card(
-            interaction,
-            "Giveaway",
-            "You have entered the giveaway.",
+        await interaction.response.send_message(
+            view=make_card(
+                "You have entered the giveaway."
+            ),
             ephemeral=True
         )
 
 
-class GiveawayView(LayoutView):
-    def __init__(self, giveaway_id):
-        super().__init__(
-            timeout=None
+@bot.command()
+@is_admin()
+async def gstart(ctx, duration=None, winners: int = None, *, reward=None):
+    if not duration or not winners or not reward:
+        return await send_card(
+            ctx,
+            "Usage: `.gstart [1h] [winners] [reward]`"
         )
 
-        self.giveaway_id = giveaway_id
-
-        self.container = Container()
-        self.text = TextDisplay("")
-
-        self.container.add_item(
-            self.text
+    if winners < 1:
+        return await send_card(
+            ctx,
+            "Winner amount must be at least 1."
         )
 
-        self.container.add_item(
-            Separator()
+    delta = parse_duration(duration)
+
+    if delta is None:
+        return await send_card(
+            ctx,
+            "Invalid giveaway duration."
         )
 
-        self.container.add_item(
-            ActionRow(
-                GiveawayJoinButton(
-                    giveaway_id
-                )
-            )
+    giveaway_id = str(
+        random.randint(
+            100000000,
+            999999999
         )
-
-        self.add_item(
-            self.container
-        )
-
-        self.refresh()
-
-    def refresh(self):
-        giveaway = giveaways.get(
-            self.giveaway_id
-        )
-
-        if not giveaway:
-            self.text.content = (
-                "## Giveaway\n\n"
-                "This giveaway has ended."
-            )
-            return
-
-        remaining = max(
-            0,
-            int(
-                (
-                    giveaway["ends_at"]
-                    - discord.utils.utcnow()
-                ).total_seconds()
-            )
-        )
-
-        end_time = format_end_time(
-            giveaway["ends_at"]
-        )
-
-        self.text.content = (
-            f"## {giveaway['reward']}\n\n"
-            f"Winners: `{giveaway['winners']}`\n"
-            f"Ends in `{format_duration(remaining)}`\n"
-            f"End at **{end_time}**\n\n"
-            f"Hosted by: {giveaway['host'].mention}\n\n"
-            "Click the button below to participate."
-        )
-
-
-async def giveaway_loop(
-    giveaway_id
-):
-    while giveaway_id in giveaways:
-        giveaway = giveaways[
-            giveaway_id
-        ]
-
-        remaining = (
-            giveaway["ends_at"]
-            - discord.utils.utcnow()
-        ).total_seconds()
-
-        if remaining <= 0:
-            await finish_giveaway(
-                giveaway_id
-            )
-            break
-
-        channel = bot.get_channel(
-            giveaway["channel_id"]
-        )
-
-        if channel:
-            try:
-                message = await channel.fetch_message(
-                    giveaway["message_id"]
-                )
-
-                await message.edit(
-                    view=GiveawayView(
-                        giveaway_id
-                    )
-                )
-
-            except discord.HTTPException:
-                pass
-
-        await asyncio.sleep(1)
-
-
-async def finish_giveaway(
-    giveaway_id
-):
-    giveaway = giveaways.get(
-        giveaway_id
     )
 
-    if not giveaway:
+    ends_at = discord.utils.utcnow() + delta
+
+    giveaways[giveaway_id] = {
+        "id": giveaway_id,
+        "reward": reward,
+        "winners": winners,
+        "ends_at": ends_at,
+        "host": ctx.author,
+        "channel_id": ctx.channel.id,
+        "message_id": None,
+        "entries": set()
+    }
+
+    message = await ctx.send(
+        view=GiveawayView(giveaway_id)
+    )
+
+    giveaways[giveaway_id]["message_id"] = message.id
+
+    task = asyncio.create_task(
+        finish_giveaway(giveaway_id)
+    )
+
+    giveaway_tasks[giveaway_id] = task
+
+
+async def finish_giveaway(giveaway_id):
+    data = giveaways.get(giveaway_id)
+
+    if not data:
         return
 
-    eligible_entries = [
-        user_id
-        for user_id in giveaway["entries"]
-        if user_id not in giveaway_blacklist[
-            giveaway["guild_id"]
-        ]
-    ]
+    seconds = (
+        data["ends_at"] -
+        discord.utils.utcnow()
+    ).total_seconds()
 
-    winner_count = min(
-        giveaway["winners"],
-        len(eligible_entries)
+    if seconds > 0:
+        await asyncio.sleep(seconds)
+
+    data = giveaways.get(giveaway_id)
+
+    if not data:
+        return
+
+    entries = list(data["entries"])
+
+    winners_count = min(
+        data["winners"],
+        len(entries)
     )
 
-    if winner_count:
+    if winners_count:
         winners = random.sample(
-            eligible_entries,
-            winner_count
+            entries,
+            winners_count
         )
 
         winner_text = "\n".join(
@@ -2059,164 +1803,65 @@ async def finish_giveaway(
             for user_id in winners
         )
     else:
-        winner_text = (
-            "No eligible winners."
-        )
+        winner_text = "No eligible participants."
 
     channel = bot.get_channel(
-        giveaway["channel_id"]
+        data["channel_id"]
     )
 
     if channel:
-        await send_card(
-            channel,
-            giveaway["reward"],
-            (
-                "Giveaway ended.\n\n"
-                f"Winners:\n{winner_text}\n\n"
-                f"Entries: `{len(eligible_entries)}`"
-            )
-        )
-
         try:
             message = await channel.fetch_message(
-                giveaway["message_id"]
+                data["message_id"]
             )
 
             await message.edit(
                 view=make_card(
-                    giveaway["reward"],
-                    (
-                        "Giveaway ended.\n\n"
-                        f"Winners:\n{winner_text}"
-                    )
+                    f"## Giveaway Ended\n\n"
+                    f"Reward: **{data['reward']}**\n"
+                    f"Winners:\n{winner_text}"
                 )
             )
 
         except discord.HTTPException:
             pass
 
-    giveaways.pop(
-        giveaway_id,
-        None
-    )
+    giveaways.pop(giveaway_id, None)
+    giveaway_tasks.pop(giveaway_id, None)
 
-    task = giveaway_tasks.pop(
-        giveaway_id,
-        None
-    )
+
+@bot.command()
+@is_admin()
+async def gend(ctx, message_id: int = None):
+    if message_id is None:
+        return await send_card(
+            ctx,
+            "Usage: `.gend [message id]`"
+        )
+
+    found = None
+
+    for giveaway_id, data in giveaways.items():
+        if data["message_id"] == message_id:
+            found = giveaway_id
+            break
+
+    if found is None:
+        return await send_card(
+            ctx,
+            "Giveaway not found."
+        )
+
+    task = giveaway_tasks.get(found)
 
     if task:
         task.cancel()
 
+    await finish_giveaway(found)
 
-@bot.command()
-@is_admin()
-async def gstart(
-    ctx,
-    duration=None,
-    winners: int = None,
-    *,
-    reward=None
-):
-    if (
-        not duration
-        or winners is None
-        or not reward
-    ):
-        await send_card(
-            ctx,
-            "Giveaway",
-            "Usage: `.gstart 1h 1 Nitro`"
-        )
-        return
-
-    try:
-        seconds = parse_duration(
-            duration
-        )
-    except ValueError as error:
-        await send_card(
-            ctx,
-            "Giveaway",
-            str(error)
-        )
-        return
-
-    if winners <= 0:
-        await send_card(
-            ctx,
-            "Giveaway",
-            "Winner amount must be greater than zero."
-        )
-        return
-
-    giveaway_id = str(
-        ctx.message.id
-    )
-
-    ends_at = (
-        discord.utils.utcnow()
-        + timedelta(
-            seconds=seconds
-        )
-    )
-
-    giveaways[giveaway_id] = {
-        "guild_id": ctx.guild.id,
-        "channel_id": ctx.channel.id,
-        "message_id": None,
-        "reward": reward,
-        "winners": winners,
-        "host": ctx.author,
-        "ends_at": ends_at,
-        "entries": set()
-    }
-
-    message = await ctx.send(
-        view=GiveawayView(
-            giveaway_id
-        )
-    )
-
-    giveaways[giveaway_id][
-        "message_id"
-    ] = message.id
-
-    giveaway_tasks[
-        giveaway_id
-    ] = asyncio.create_task(
-        giveaway_loop(
-            giveaway_id
-        )
-    )
-
-
-@bot.command()
-@is_admin()
-async def gend(
-    ctx,
-    message_id: int
-):
-    giveaway_id = None
-
-    for key, giveaway in giveaways.items():
-        if giveaway[
-            "message_id"
-        ] == message_id:
-            giveaway_id = key
-            break
-
-    if not giveaway_id:
-        await send_card(
-            ctx,
-            "Giveaway",
-            "Giveaway not found."
-        )
-        return
-
-    await finish_giveaway(
-        giveaway_id
+    await send_card(
+        ctx,
+        "Giveaway ended."
     )
 
 
@@ -2224,50 +1869,236 @@ async def gend(
 @is_admin()
 async def gblacklist(
     ctx,
-    member: discord.Member
+    member: discord.Member = None
 ):
+    if member is None:
+        return await send_card(
+            ctx,
+            "Usage: `.gblacklist @user`"
+        )
+
     blacklist = giveaway_blacklist[
         ctx.guild.id
     ]
 
     if member.id in blacklist:
-        blacklist.remove(
-            member.id
-        )
+        blacklist.remove(member.id)
 
         await send_card(
             ctx,
-            "Giveaway Blacklist",
-            (
-                f"{member.mention} has been "
-                "removed from the blacklist."
-            )
+            f"{member.mention} has been removed from the giveaway blacklist."
         )
 
     else:
-        blacklist.add(
-            member.id
-        )
-
-        for giveaway in giveaways.values():
-            if (
-                giveaway["guild_id"]
-                == ctx.guild.id
-            ):
-                giveaway[
-                    "entries"
-                ].discard(
-                    member.id
-                )
+        blacklist.add(member.id)
 
         await send_card(
             ctx,
-            "Giveaway Blacklist",
-            (
-                f"{member.mention} has been "
-                "added to the blacklist."
-            )
+            f"{member.mention} has been added to the giveaway blacklist."
         )
+
+
+# =========================================================
+# ROLES
+# =========================================================
+
+SUPPORTED_ROLES = (
+    "friend",
+    "mod",
+    "staff",
+    "jail",
+    "vip"
+)
+
+
+@bot.command(name="set")
+@is_admin()
+async def set_role(
+    ctx,
+    role_type=None,
+    role: discord.Role = None
+):
+    if role_type is None or role is None:
+        return await send_card(
+            ctx,
+            "Usage:\n"
+            "`.set friend @role`\n"
+            "`.set mod @role`\n"
+            "`.set staff @role`\n"
+            "`.set jail @role`\n"
+            "`.set vip @role`"
+        )
+
+    role_type = role_type.lower()
+
+    if role_type not in SUPPORTED_ROLES:
+        return await send_card(
+            ctx,
+            "Supported roles:\n"
+            "`friend`\n"
+            "`mod`\n"
+            "`staff`\n"
+            "`jail`\n"
+            "`vip`"
+        )
+
+    if role >= ctx.guild.me.top_role:
+        return await send_card(
+            ctx,
+            "I cannot manage this role because it is above or equal to my highest role."
+        )
+
+    guild_settings[
+        ctx.guild.id
+    ]["roles"][role_type] = role.id
+
+    await send_card(
+        ctx,
+        f"## Role Setup\n\n"
+        f"Type: `{role_type}`\n"
+        f"Role: {role.mention}",
+        allowed_mentions=discord.AllowedMentions(
+            everyone=False,
+            users=False,
+            roles=False,
+            replied_user=False
+        )
+    )
+
+
+async def give_configured_role(
+    ctx,
+    role_type,
+    member=None
+):
+    if member is None:
+        reference = ctx.message.reference
+
+        if reference and reference.message_id:
+            try:
+                replied_message = await ctx.channel.fetch_message(
+                    reference.message_id
+                )
+                member = replied_message.author
+
+            except discord.HTTPException:
+                pass
+
+    if member is None:
+        return await send_card(
+            ctx,
+            f"Usage: `.{role_type} @user`\n"
+            f"Or reply to a user's message with `.{role_type}`"
+        )
+
+    role_id = guild_settings[
+        ctx.guild.id
+    ]["roles"].get(role_type)
+
+    if not role_id:
+        return await send_card(
+            ctx,
+            f"The `{role_type}` role has not been configured.\n"
+            f"Use `.set {role_type} @role` first."
+        )
+
+    role = ctx.guild.get_role(role_id)
+
+    if role is None:
+        return await send_card(
+            ctx,
+            f"The configured `{role_type}` role no longer exists."
+        )
+
+    if role >= ctx.guild.me.top_role:
+        return await send_card(
+            ctx,
+            "I cannot manage this role because it is above or equal to my highest role."
+        )
+
+    if member == ctx.guild.me:
+        return await send_card(
+            ctx,
+            "I cannot give this role to myself."
+        )
+
+    try:
+        await member.add_roles(
+            role,
+            reason=f"{role_type} role given by {ctx.author}"
+        )
+    except discord.Forbidden:
+        return await send_card(
+            ctx,
+            "I do not have permission to give this role."
+        )
+
+    # User mention may work normally.
+    # Role mention is visually shown but role notifications are suppressed.
+    allowed_mentions = discord.AllowedMentions(
+        users=True,
+        roles=False,
+        everyone=False,
+        replied_user=False
+    )
+
+    await send_card(
+        ctx,
+        f"## {role_type.title()}\n\n"
+        f"Given User: {member.mention}\n"
+        f"Role: {role.mention}",
+        allowed_mentions=allowed_mentions
+    )
+
+
+@bot.command()
+@is_admin()
+async def friend(ctx, member: discord.Member = None):
+    await give_configured_role(
+        ctx,
+        "friend",
+        member
+    )
+
+
+@bot.command()
+@is_admin()
+async def mod(ctx, member: discord.Member = None):
+    await give_configured_role(
+        ctx,
+        "mod",
+        member
+    )
+
+
+@bot.command()
+@is_admin()
+async def staff(ctx, member: discord.Member = None):
+    await give_configured_role(
+        ctx,
+        "staff",
+        member
+    )
+
+
+@bot.command()
+@is_admin()
+async def jail(ctx, member: discord.Member = None):
+    await give_configured_role(
+        ctx,
+        "jail",
+        member
+    )
+
+
+@bot.command()
+@is_admin()
+async def vip(ctx, member: discord.Member = None):
+    await give_configured_role(
+        ctx,
+        "vip",
+        member
+    )
 
 
 # =========================================================
@@ -2275,69 +2106,46 @@ async def gblacklist(
 # =========================================================
 
 @bot.event
-async def on_command_error(
-    ctx,
-    error
-):
-    if isinstance(
-        error,
-        commands.CommandNotFound
-    ):
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
         return
 
-    if isinstance(
-        error,
-        commands.CheckFailure
-    ):
-        await send_card(
+    if isinstance(error, commands.MissingPermissions):
+        return await send_card(
             ctx,
-            "Permission Denied",
-            "You need administrator permissions to use this command."
+            "You do not have permission to use this command."
         )
-        return
 
-    if isinstance(
-        error,
-        commands.MissingRequiredArgument
-    ):
-        await send_card(
+    if isinstance(error, commands.CheckFailure):
+        return await send_card(
             ctx,
-            "Missing Argument",
-            f"Missing argument: `{error.param.name}`"
+            "Administrator permission required."
         )
-        return
 
-    if isinstance(
-        error,
-        commands.BadArgument
-    ):
-        await send_card(
+    if isinstance(error, commands.MissingRequiredArgument):
+        return await send_card(
             ctx,
-            "Invalid Argument",
-            "One or more arguments are invalid."
+            "Missing required argument."
         )
-        return
 
-    if isinstance(
-        error,
-        commands.CommandInvokeError
-    ):
-        if isinstance(
-            error.original,
-            discord.Forbidden
-        ):
-            await send_card(
-                ctx,
-                "Permission Error",
-                "I do not have permission to perform that action."
-            )
-            return
+    if isinstance(error, commands.BadArgument):
+        return await send_card(
+            ctx,
+            "Invalid argument."
+        )
 
-    raise error
+    print(
+        f"Command error in {ctx.command}: {error}"
+    )
 
 
 # =========================================================
-# RUN
+# START
 # =========================================================
+
+if not TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN was not found in the environment."
+    )
 
 bot.run(TOKEN)
